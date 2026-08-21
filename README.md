@@ -10,6 +10,16 @@
 
 ---
 
+## Pitch video
+
+<video src="https://raw.githubusercontent.com/valentinleconte/openrag-twin/main/communication/openrag-twin-tech-pitch.mp4" controls muted width="100%"></video>
+
+A ~3-minute walkthrough of what this project is, the architecture, the routing scenario, and one
+real bug found and fixed along the way. If the embed above doesn't load for you, the same file is
+directly available in [`communication/`](communication/).
+
+---
+
 ## Why this exists
 
 I'm preparing for a **Field/Client Engineer** interview at IBM. Instead of reading about
