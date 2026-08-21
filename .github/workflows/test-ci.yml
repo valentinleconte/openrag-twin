@@ -261,7 +261,7 @@ jobs:
 
       - name: Download OpenRAG image artifacts (Fork fallback)
         if: env.IS_FORK == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: openrag-ci-image-*-${{ github.sha }}
           path: .ci-artifacts
@@ -407,7 +407,7 @@ jobs:
 
       - name: Download OpenRAG image artifacts (Fork fallback)
         if: env.IS_FORK == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: openrag-ci-image-*-${{ github.sha }}
           path: .ci-artifacts
@@ -533,7 +533,7 @@ jobs:
         run: npm ci
 
       - name: Download all shard blob reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: frontend/all-blob-reports
           pattern: blob-report-shard-*
