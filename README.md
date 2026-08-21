@@ -12,11 +12,12 @@
 
 ## Pitch video
 
-<video src="https://raw.githubusercontent.com/valentinleconte/openrag-twin/main/communication/openrag-twin-tech-pitch.mp4" controls muted width="100%"></video>
+[![Watch the pitch video](communication/thumbnail.png)](https://raw.githubusercontent.com/valentinleconte/openrag-twin/main/communication/openrag-twin-tech-pitch.mp4)
 
-A ~3-minute walkthrough of what this project is, the architecture, the routing scenario, and one
-real bug found and fixed along the way. If the embed above doesn't load for you, the same file is
-directly available in [`communication/`](communication/).
+*Click to watch (~3 min)* — what this project is, the architecture, the routing scenario, and one
+real bug found and fixed along the way. GitHub doesn't autoplay video in a README, so this opens
+the raw file, which plays natively in most browsers. Also directly available in
+[`communication/`](communication/) if you'd rather grab the file itself.
 
 ---
 
