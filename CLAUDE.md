@@ -190,3 +190,20 @@ Corpus : regénérer avec
   `lint-backend.yml`, `lint-frontend.yml`, `react-doctor.yml`). Supprimés : tout ce qui
   publie des packages/images Docker, déploie une doc/Pages, gère des labels de PR, ou
   tourne sur un cron — inapplicable à un fork perso et risque de red-X silencieux.
+- **Correctif important** : le squash initial gardait un trailer `Co-Authored-By: Claude`
+  dans le message de commit — GitHub le traite comme un **contributeur distinct**
+  (`?author=claude` a sa propre page), ce qui repassait le compteur à 2. Retiré, re-squashé.
+  Vérifié à la source (`/graphs/contributors`, pas juste l'API REST qui peut être en
+  avance sur le cache du graphe) : 1 seul contributeur.
+- **Nettoyage racine du repo** (moins de scroll avant d'arriver au README) : supprimé
+  `kubernetes/` (opérateur K8s, jamais utilisé par notre stack Docker Compose),
+  `sdks/` (SDKs client Python/TS, idem) et `.coderabbit.yaml` (bot tiers non installé
+  sur ce repo). Vérifié avant suppression : aucun n'est référencé par un Dockerfile,
+  `docker-compose.yml`, ou un des 5 workflows CI gardés sur le chemin `push` (un seul
+  job de `test-ci.yml`, gated `pull_request`-only, référence `sdks/typescript` — ne
+  tourne jamais sur nos push directs à `main`). Tout le reste du contenu à la racine
+  (Dockerfiles, docker-compose*.yml, `src/`, `frontend/`, `flows/`, `securityconfig/` +
+  `cloud_securityconfig/` — les deux copiés dans l'image OpenSearch, `custom_components/`,
+  `enhancements/` — vrai code importé par `src/connectors/registry.py`, `plugins/` —
+  les skills Claude Code y symlinkent) est activement référencé par le build ou le
+  runtime : **pas touché**, casser un de ces chemins casse `make dev-cpu`.

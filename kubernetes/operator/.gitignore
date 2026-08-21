@@ -1,6 +1,0 @@
-# Tool binaries downloaded by make deps
-bin/
-
-# Build output
-cover.out
-dist/
