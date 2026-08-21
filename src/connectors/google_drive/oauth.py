@@ -1,0 +1,281 @@
+import asyncio
+import json
+import os
+
+import requests as req_lib
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+
+def _verify_id_token(id_token: str | None) -> dict | None:
+    """
+    Verify Google ID token signature, expiry, audience, and issuer.
+
+    Returns the verified claims dict on success.
+    Raises JWTVerificationError (or a subclass) if verification fails — callers
+    must NOT proceed with credentials that carry an invalid ID token.
+    Returns None only when no id_token is present or verification is not configured.
+    """
+    if not id_token:
+        return None
+
+    from config.settings import GOOGLE_OAUTH_CLIENT_ID
+    from utils.jwt_verification import verify_google_id_token
+
+    if not GOOGLE_OAUTH_CLIENT_ID:
+        logger.warning("GOOGLE_OAUTH_CLIENT_ID not configured - skipping ID token verification")
+        return None
+
+    # Raises JWTVerificationError on any failure — intentionally not caught here
+    # so that callers propagate the error and refuse to use invalid credentials.
+    claims = verify_google_id_token(id_token, GOOGLE_OAUTH_CLIENT_ID)
+    logger.debug("Google ID token verified, sub=%s", claims.get("sub"))
+    return claims
+
+
+_REFRESH_TIMEOUT_SECONDS = 30
+
+
+class _TimeoutSession(req_lib.Session):
+    def __init__(self, timeout: float) -> None:
+        super().__init__()
+        self._timeout = timeout
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", self._timeout)
+        return super().request(method, url, **kwargs)
+
+
+class GoogleDriveOAuth:
+    """Handles Google Drive OAuth authentication flow"""
+
+    REQUIRED_SCOPES = [
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
+    ]
+
+    SCOPES = [
+        "openid",
+        "email",
+        "profile",
+        *REQUIRED_SCOPES,
+        "https://www.googleapis.com/auth/cloud-identity.groups.readonly",
+        "https://www.googleapis.com/auth/admin.directory.group.readonly",
+    ]
+
+    # Force "consent" so Google reliably returns a refresh token on (re)connect.
+    AUTH_PROMPT = "consent"
+
+    AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+    TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+
+    def __init__(
+        self,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+        token_file: str = "token.json",
+    ):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.token_file = token_file
+        self.creds: Credentials | None = None
+
+    def _make_timeout_request(self) -> Request:
+        """Build a google-auth Request transport with a bounded timeout."""
+        return Request(session=_TimeoutSession(_REFRESH_TIMEOUT_SECONDS))
+
+    def _missing_required_scopes(self, scopes: list[str] | None) -> list[str]:
+        current_scopes = set(scopes or [])
+        return [scope for scope in self.REQUIRED_SCOPES if scope not in current_scopes]
+
+    def _remove_token_file(self) -> None:
+        if os.path.exists(self.token_file):
+            try:
+                os.remove(self.token_file)
+            except Exception:
+                logger.debug("[GoogleDrive] load_credentials: failed to remove token file")
+
+    async def load_credentials(self) -> Credentials | None:
+        """Load existing credentials from token file"""
+        from utils.encryption import read_encrypted_file
+
+        logger.debug("[GoogleDrive] load_credentials: reading token file %s", self.token_file)
+        raw_data, needs_upgrade = await read_encrypted_file(self.token_file)
+        if raw_data is None:
+            logger.debug("[GoogleDrive] load_credentials: no token file found")
+            return None
+
+        try:
+            token_data = json.loads(raw_data)
+        except Exception:
+            logger.debug("[GoogleDrive] load_credentials: corrupted token file, removing")
+            if os.path.exists(self.token_file):
+                os.remove(self.token_file)
+            return None
+
+        logger.debug(
+            "[GoogleDrive] load_credentials: token data loaded, creating Credentials object"
+        )
+
+        missing_scopes = self._missing_required_scopes(token_data.get("scopes"))
+        if missing_scopes:
+            logger.info(
+                "[GoogleDrive] load_credentials: stored token is missing required scopes; "
+                "removing it so the user re-authenticates. missing_scopes=%s",
+                missing_scopes,
+            )
+            self.creds = None
+            self._remove_token_file()
+            return None
+
+        self.creds = Credentials(
+            token=token_data.get("token"),
+            refresh_token=token_data.get("refresh_token"),
+            id_token=token_data.get("id_token"),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+            scopes=token_data.get("scopes", self.SCOPES),
+        )
+
+        # Set expiry if available (ensure timezone-naive for Google auth compatibility)
+        if token_data.get("expiry"):
+            from datetime import datetime
+
+            expiry_dt = datetime.fromisoformat(token_data["expiry"])
+            self.creds.expiry = expiry_dt.replace(tzinfo=None)
+            logger.debug("[GoogleDrive] load_credentials: token expiry=%s", self.creds.expiry)
+
+        if needs_upgrade and self.creds:
+            await self.save_credentials()
+
+        if self.creds and self.creds.expired and self.creds.refresh_token:
+            logger.debug(
+                "[GoogleDrive] load_credentials: token expired, refreshing (timeout=%ss)",
+                _REFRESH_TIMEOUT_SECONDS,
+            )
+            try:
+                await asyncio.to_thread(self.creds.refresh, self._make_timeout_request())
+                logger.debug("[GoogleDrive] load_credentials: token refresh succeeded")
+                await self.save_credentials()
+            except Exception as e:
+                logger.debug("[GoogleDrive] load_credentials: token refresh failed: %s", e)
+                self.creds = None
+                self._remove_token_file()
+                raise ValueError(
+                    f"Failed to refresh Google Drive credentials. "
+                    f"The refresh token may have expired or been revoked. "
+                    f"Please re-authenticate: {str(e)}"
+                ) from e
+        else:
+            logger.debug(
+                "[GoogleDrive] load_credentials: token valid=%s, expired=%s, has_refresh=%s",
+                self.creds.valid if self.creds else None,
+                self.creds.expired if self.creds else None,
+                bool(self.creds.refresh_token) if self.creds else None,
+            )
+
+        return self.creds
+
+    async def save_credentials(self):
+        """Save credentials to token file (without client_secret)"""
+        if self.creds:
+            scopes = getattr(self.creds, "granted_scopes", None) or self.creds.scopes or self.SCOPES
+            # Create minimal token data without client_secret
+            token_data = {
+                "token": self.creds.token,
+                "refresh_token": self.creds.refresh_token,
+                "id_token": self.creds.id_token,
+                "scopes": list(scopes),
+            }
+
+            # Add expiry if available
+            if self.creds.expiry:
+                token_data["expiry"] = self.creds.expiry.isoformat()
+
+            from utils.encryption import write_encrypted_file
+
+            await write_encrypted_file(self.token_file, json.dumps(token_data))
+
+    def create_authorization_url(self, redirect_uri: str, state: str | None = None) -> str:
+        """Create authorization URL for OAuth flow"""
+        # Create flow from client credentials directly
+        client_config = {
+            "web": {
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        }
+
+        flow = Flow.from_client_config(client_config, scopes=self.SCOPES, redirect_uri=redirect_uri)
+
+        kwargs = {
+            "access_type": "offline",
+            "include_granted_scopes": "true",
+            "prompt": "consent",  # Force consent to get refresh token
+        }
+        if state:
+            kwargs["state"] = state
+
+        auth_url, _ = flow.authorization_url(**kwargs)
+
+        # Store flow state for later use
+        self._flow_state = flow.state
+        self._flow = flow
+
+        return auth_url
+
+    async def handle_authorization_callback(self, authorization_code: str, state: str) -> bool:
+        """Handle OAuth callback and exchange code for tokens"""
+        if not hasattr(self, "_flow") or self._flow_state != state:
+            raise ValueError("Invalid OAuth state")
+
+        logger.debug("[GoogleDrive] handle_authorization_callback: exchanging auth code for tokens")
+        await asyncio.to_thread(self._flow.fetch_token, code=authorization_code)
+        self.creds = self._flow.credentials
+        logger.debug("[GoogleDrive] handle_authorization_callback: token exchange complete")
+
+        # Verify the ID token immediately after code exchange. Raises JWTVerificationError
+        # on failure — the connection is rejected before credentials are persisted.
+        if self.creds and self.creds.id_token:
+            _verify_id_token(self.creds.id_token)
+
+        await self.save_credentials()
+        return True
+
+    async def is_authenticated(self) -> bool:
+        """Check if we have valid credentials"""
+        if not self.creds:
+            await self.load_credentials()
+
+        result = bool(self.creds and self.creds.valid)
+        logger.debug("[GoogleDrive] is_authenticated: %s", result)
+        return result
+
+    def get_service(self):
+        """Get authenticated Google Drive service"""
+        if not self.creds or not self.creds.valid:
+            raise ValueError("Not authenticated")
+
+        logger.debug("[GoogleDrive] get_service: building Drive v3 service")
+        return build("drive", "v3", credentials=self.creds)
+
+    async def revoke_credentials(self):
+        """Revoke credentials and delete token file"""
+        if self.creds:
+            logger.debug("[GoogleDrive] revoke_credentials: revoking token")
+            await asyncio.to_thread(self.creds.revoke, self._make_timeout_request())
+
+        if os.path.exists(self.token_file):
+            os.remove(self.token_file)
+
+        self.creds = None
+        logger.debug("[GoogleDrive] revoke_credentials: done")

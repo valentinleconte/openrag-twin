@@ -1,0 +1,248 @@
+import os
+from collections import defaultdict
+
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+
+def process_text_file(file_path: str) -> dict:
+    """
+    Process a plain text file without using docling.
+    Returns the same structure as extract_relevant() for consistency.
+
+    Args:
+        file_path: Path to the .txt file
+
+    Returns:
+        dict with keys: id, filename, mimetype, chunks
+    """
+    from utils.hash_utils import hash_id
+
+    # Read the file
+    with open(file_path, encoding="utf-8", errors="replace") as f:
+        content = f.read()
+
+    # Compute hash
+    file_hash = hash_id(file_path)
+    filename = os.path.basename(file_path)
+
+    # Split content into chunks of ~1000 characters to match typical docling chunk sizes
+    # This ensures embeddings stay within reasonable token limits
+    chunk_size = 1000
+    chunks = []
+
+    # Split by paragraphs first (double newline)
+    paragraphs = content.split("\n\n")
+    current_chunk = ""
+    chunk_index = 0
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        # If adding this paragraph would exceed chunk size, save current chunk
+        if len(current_chunk) + len(para) + 2 > chunk_size and current_chunk:
+            chunks.append(
+                {
+                    "page": chunk_index + 1,  # Use chunk_index + 1 as "page" number
+                    "type": "text",
+                    "text": current_chunk.strip(),
+                }
+            )
+            chunk_index += 1
+            current_chunk = para
+        else:
+            if current_chunk:
+                current_chunk += "\n\n" + para
+            else:
+                current_chunk = para
+
+    # Add the last chunk if any
+    if current_chunk.strip():
+        chunks.append({"page": chunk_index + 1, "type": "text", "text": current_chunk.strip()})
+
+    # If no chunks were created (empty file), create a single empty chunk
+    if not chunks:
+        chunks.append({"page": 1, "type": "text", "text": ""})
+
+    return {
+        "id": file_hash,
+        "filename": filename,
+        "mimetype": "text/plain",
+        "chunks": chunks,
+    }
+
+
+def extract_relevant(doc_dict: dict) -> dict:
+    """
+    Given the full export_to_dict() result:
+      - Grabs origin metadata (hash, filename, mimetype)
+      - Finds every text fragment in `texts`, groups them by page_no
+      - Flattens tables in `tables` into tab-separated text, grouping by row
+      - Concatenates each page's fragments and each table into its own chunk
+    Returns a slimmed dict ready for indexing, with each chunk under "text".
+    """
+    origin = doc_dict.get("origin", {})
+    chunks = []
+
+    # 1) process free-text fragments
+    page_texts = defaultdict(list)
+    for txt in doc_dict.get("texts", []):
+        prov = txt.get("prov", [])
+        page_no = prov[0].get("page_no") if prov else None
+        if page_no is None:
+            page_no = 1
+        page_texts[page_no].append(txt.get("text", "").strip())
+
+    for page in sorted(page_texts):
+        chunks.append({"page": page, "type": "text", "text": "\n".join(page_texts[page])})
+
+    # 2) process tables
+    for t_idx, table in enumerate(doc_dict.get("tables", [])):
+        prov = table.get("prov", [])
+        page_no = prov[0].get("page_no") if prov else None
+        if page_no is None:
+            page_no = 1
+
+        # group cells by their row index
+        rows = defaultdict(list)
+        table_data = table.get("data")
+        if table_data:
+            for cell in table_data.get("table_cells", []):
+                r = cell.get("start_row_offset_idx")
+                c = cell.get("start_col_offset_idx")
+                text = cell.get("text", "").strip()
+                rows[r].append((c, text))
+
+        # build a tab‑separated line for each row, in order
+        flat_rows = []
+        for r in sorted(rows):
+            cells = [txt for _, txt in sorted(rows[r], key=lambda x: x[0])]
+            flat_rows.append("\t".join(cells))
+
+        chunks.append(
+            {
+                "page": page_no,
+                "type": "table",
+                "table_index": t_idx,
+                "text": "\n".join(flat_rows),
+            }
+        )
+
+    # 3) process picture descriptions (VLM-generated annotations)
+    # Docling stores these under pictures[].annotations with kind == "description".
+    # Without this, image-only documents (no text layer) yield zero chunks on the
+    # non-Langflow path, which surfaces as a misleading "corrupted or invalid" error.
+    # The Langflow path already captures them via Docling's export_to_markdown.
+    for p_idx, picture in enumerate(doc_dict.get("pictures", [])):
+        prov = picture.get("prov", [])
+        page_no = prov[0].get("page_no") if prov else None
+        if page_no is None:
+            page_no = 1
+
+        descriptions = [
+            ann.get("text", "").strip()
+            for ann in picture.get("annotations", [])
+            if ann.get("kind") == "description" and ann.get("text", "").strip()
+        ]
+        if not descriptions:
+            continue
+
+        chunks.append(
+            {
+                "page": page_no,
+                "type": "picture",
+                "picture_index": p_idx,
+                "text": "\n".join(descriptions),
+            }
+        )
+
+    return {
+        "id": origin.get("binary_hash"),
+        "filename": origin.get("filename"),
+        "mimetype": origin.get("mimetype"),
+        "chunks": chunks,
+    }
+
+
+def resplit_chunks_character_windows(
+    chunks: list,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> list:
+    """Split long chunk texts into fixed-size character windows with overlap.
+
+    Used by the non-Langflow ingestion path when the UI supplies ``chunkSize`` /
+    ``chunkOverlap``. Invalid combinations (non-positive size or overlap >= size)
+    return ``chunks`` unchanged.
+    """
+    if chunk_size <= 0 or chunk_overlap >= chunk_size:
+        return chunks
+    stride = chunk_size - chunk_overlap
+    if stride <= 0:
+        return chunks
+
+    out: list = []
+    for ch in chunks:
+        text = ch.get("text") if isinstance(ch, dict) else None
+        if not isinstance(text, str):
+            out.append(dict(ch) if isinstance(ch, dict) else ch)
+            continue
+        if len(text) <= chunk_size:
+            out.append(dict(ch))
+            continue
+        start = 0
+        while start < len(text):
+            end = min(start + chunk_size, len(text))
+            piece = text[start:end]
+            new_ch = dict(ch)
+            new_ch["text"] = piece
+            out.append(new_ch)
+            if end >= len(text):
+                break
+            start += stride
+    return out
+
+
+def split_chunks_by_max_tokens(
+    chunks: list[dict], max_tokens: int, model: str | None = None
+) -> list[dict]:
+    """Split any chunks whose token count exceeds max_tokens.
+
+    Ensures that when chunk texts are sent to the embedding model, they don't get
+    further split by token limits in the batching helper, allowing the final
+    embeddings and chunks to align 1-to-1.
+    """
+    import tiktoken
+
+    from config.settings import get_embedding_model
+
+    model = model or get_embedding_model()
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+    except KeyError:
+        encoding = tiktoken.get_encoding("cl100k_base")
+
+    new_chunks = []
+    for chunk in chunks:
+        text = chunk.get("text", "")
+        if not text:
+            new_chunks.append(chunk)
+            continue
+
+        tokens = encoding.encode(text)
+        if len(tokens) <= max_tokens:
+            new_chunks.append(chunk)
+            continue
+
+        # Split tokens into segments of at most max_tokens size
+        for i in range(0, len(tokens), max_tokens):
+            chunk_tokens = tokens[i : i + max_tokens]
+            chunk_text = encoding.decode(chunk_tokens)
+            new_chunk = dict(chunk)
+            new_chunk["text"] = chunk_text
+            new_chunks.append(new_chunk)
+
+    return new_chunks

@@ -1,0 +1,163 @@
+"""Public /v1/* route registrations (API-key auth)."""
+
+from fastapi import FastAPI
+
+from api.v1 import (
+    chat as v1_chat,
+)
+from api.v1 import (
+    documents as v1_documents,
+)
+from api.v1 import (
+    files as v1_files,
+)
+from api.v1 import (
+    knowledge_filters as v1_knowledge_filters,
+)
+from api.v1 import (
+    models as v1_models,
+)
+from api.v1 import (
+    search as v1_search,
+)
+from api.v1 import (
+    settings as v1_settings,
+)
+from api.v1 import status as v1_status
+from utils.run_mode_utils import is_run_mode_oss
+
+
+def register_public_v1_routes(app: FastAPI):
+
+    # Chat endpoints
+    app.add_api_route("/v1/chat", v1_chat.chat_create_endpoint, methods=["POST"], tags=["public"])
+    app.add_api_route("/v1/chat", v1_chat.chat_list_endpoint, methods=["GET"], tags=["public"])
+    app.add_api_route(
+        "/v1/chat/{chat_id}",
+        v1_chat.chat_get_endpoint,
+        methods=["GET"],
+        tags=["public"],
+    )
+    app.add_api_route(
+        "/v1/chat/{chat_id}",
+        v1_chat.chat_delete_endpoint,
+        methods=["DELETE"],
+        tags=["public"],
+    )
+
+    # Search endpoint
+    app.add_api_route("/v1/search", v1_search.search_endpoint, methods=["POST"], tags=["public"])
+
+    # Documents endpoints
+    app.add_api_route(
+        "/v1/documents/ingest",
+        v1_documents.ingest_endpoint,
+        methods=["POST"],
+        tags=["public"],
+    )
+    # Literal sub-paths must be registered before the parameterised /{task_id}
+    # so Starlette does not absorb "enhanced" as a task_id value.
+    app.add_api_route(
+        "/v1/tasks/enhanced",
+        v1_documents.all_tasks_enhanced_endpoint,
+        methods=["GET"],
+        tags=["public"],
+    )
+    app.add_api_route(
+        "/v1/tasks/{task_id}",
+        v1_documents.task_status_endpoint,
+        methods=["GET"],
+        tags=["public"],
+    )
+    app.add_api_route(
+        "/v1/tasks/{task_id}/enhanced",
+        v1_documents.task_status_enhanced_endpoint,
+        methods=["GET"],
+        tags=["public"],
+    )
+    app.add_api_route(
+        "/v1/documents",
+        v1_documents.delete_document_endpoint,
+        methods=["DELETE"],
+        tags=["public"],
+    )
+
+    # Settings endpoints
+    app.add_api_route(
+        "/v1/settings",
+        v1_settings.get_settings_endpoint,
+        methods=["GET"],
+        tags=["public"],
+    )
+    app.add_api_route(
+        "/v1/settings",
+        v1_settings.update_settings_endpoint,
+        methods=["POST"],
+        tags=["public"],
+    )
+
+    # Models endpoint
+    app.add_api_route(
+        "/v1/models/{provider}",
+        v1_models.list_models_endpoint,
+        methods=["GET"],
+        tags=["public"],
+    )
+
+    # Knowledge filters endpoints
+    app.add_api_route(
+        "/v1/knowledge-filters",
+        v1_knowledge_filters.create_endpoint,
+        methods=["POST"],
+        tags=["public"],
+    )
+    app.add_api_route(
+        "/v1/knowledge-filters/search",
+        v1_knowledge_filters.search_endpoint,
+        methods=["POST"],
+        tags=["public"],
+    )
+    app.add_api_route(
+        "/v1/knowledge-filters/{filter_id}",
+        v1_knowledge_filters.get_endpoint,
+        methods=["GET"],
+        tags=["public"],
+    )
+    app.add_api_route(
+        "/v1/knowledge-filters/{filter_id}",
+        v1_knowledge_filters.update_endpoint,
+        methods=["PUT"],
+        tags=["public"],
+    )
+    app.add_api_route(
+        "/v1/knowledge-filters/{filter_id}",
+        v1_knowledge_filters.delete_endpoint,
+        methods=["DELETE"],
+        tags=["public"],
+    )
+
+    # Status endpoints (OSS-only) — component logs route must be registered before
+    # the bare /v1/status route so Starlette matches the literal "/logs" suffix
+    # rather than treating it as a {component} path parameter.
+    if is_run_mode_oss():
+        app.add_api_route(
+            "/v1/status/{component}/logs",
+            v1_status.get_component_logs_endpoint,
+            methods=["GET"],
+            tags=["public"],
+        )
+
+        app.add_api_route(
+            "/v1/status",
+            v1_status.get_status_endpoint,
+            methods=["GET"],
+            tags=["public"],
+        )
+
+    # Files get_all endpoint
+    app.add_api_route(
+        "/v1/files/get_all",
+        v1_files.get_all_files,
+        methods=["GET"],
+        tags=["public"],
+    )

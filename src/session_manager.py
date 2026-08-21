@@ -1,0 +1,375 @@
+import hashlib
+import os
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import httpx
+import jwt
+from cachetools import TTLCache
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, rsa
+
+from config.settings import (
+    IBM_AUTH_ENABLED,
+    JWT_CLAIMS_CACHE_MAX_SIZE,
+    JWT_CLAIMS_CACHE_TTL_SECONDS,
+)
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class User:
+    """User information from OAuth provider"""
+
+    user_id: str  # From OAuth sub claim
+    email: str
+    name: str
+    picture: str = None
+    provider: str = "google"
+    created_at: datetime = None
+    last_login: datetime = None
+    jwt_token: str | None = None
+    opensearch_username: str | None = None
+    opensearch_credentials: str | None = None  # Raw base64 credentials (without "Basic " prefix)
+    db_user_id: str | None = None  # Internal OpenRAG users.id
+
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = datetime.now()
+        if self.last_login is None:
+            self.last_login = datetime.now()
+
+
+@dataclass
+class AnonymousUser(User):
+    """Anonymous user"""
+
+    user_id: str = "anonymous"
+    email: str = "anonymous@localhost"
+    name: str = "Anonymous User"
+    picture: str = None
+    provider: str = "none"
+
+
+# Decoded JWT claims keyed by raw token string (Bearer prefix stripped).
+# TTLCache evicts by time and by LRU when full. Each hit also rechecks
+# token `exp` as defence-in-depth so an expired token is never served
+# from cache. Safe without a lock: UVICORN_WORKERS=1 is enforced at
+# startup and asyncio cooperative scheduling makes dict-level ops atomic
+# between awaits (same pattern as _ENSURED_USER_IDS in dependencies.py).
+_JWT_CLAIMS_CACHE: TTLCache[str, dict] = TTLCache(
+    maxsize=JWT_CLAIMS_CACHE_MAX_SIZE,
+    ttl=JWT_CLAIMS_CACHE_TTL_SECONDS,
+)
+
+
+class SessionManager:
+    """Manages user sessions and JWT tokens"""
+
+    def __init__(
+        self,
+        secret_key: str = None,
+        private_key_path: str = None,
+        public_key_path: str = None,
+    ):
+        from config.paths import get_keys_path
+
+        keys_dir = get_keys_path()
+        self.secret_key = secret_key  # Keep for backward compatibility
+        self.users: dict[str, User] = {}  # user_id -> User
+        self.user_opensearch_clients: dict[str, Any] = {}  # user_id -> OpenSearch client
+
+        self.private_key_path = private_key_path or os.path.join(keys_dir, "private_key.pem")
+        self.public_key_path = public_key_path or os.path.join(keys_dir, "public_key.pem")
+
+        # Configure JWT signing (checks env var first, falls back to key files)
+        self._configure_jwt_signing()
+
+    def _configure_jwt_signing(self):
+        """Configure JWT signing - supports env var or file-based keys"""
+        signing_key = os.getenv("JWT_SIGNING_KEY")
+
+        if signing_key:
+            if signing_key.lstrip().startswith("-----BEGIN"):
+                key = serialization.load_pem_private_key(signing_key.encode(), password=None)
+
+                self.private_key = key
+                self.public_key = key.public_key()
+                self.public_key_pem = self.public_key.public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                ).decode()
+
+                if isinstance(key, rsa.RSAPrivateKey):
+                    self.algorithm = "RS256"
+                elif isinstance(key, ec.EllipticCurvePrivateKey):
+                    curve = key.curve
+                    if isinstance(curve, ec.SECP256R1):
+                        self.algorithm = "ES256"
+                    elif isinstance(curve, ec.SECP384R1):
+                        self.algorithm = "ES384"
+                    elif isinstance(curve, ec.SECP521R1):
+                        self.algorithm = "ES512"
+                    else:
+                        raise ValueError(f"Unsupported EC curve: {curve.name}")
+                elif isinstance(key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey)):
+                    self.algorithm = "EdDSA"
+                else:
+                    raise ValueError(f"Unsupported private key type: {type(key)}")
+
+            else:
+                # Plain string = symmetric (HS256)
+                self.private_key = signing_key
+                self.public_key = signing_key  # Same key for verification
+                self.public_key_pem = None  # No JWKS for symmetric
+                self.algorithm = "HS256"
+        else:
+            if IBM_AUTH_ENABLED:
+                # External auth handles authentication; local signing is not required.
+                self.private_key = None
+                self.public_key = None
+                self.public_key_pem = None
+                self.algorithm = None
+            else:
+                # Fall back to file-based RSA keys
+                self._load_rsa_keys()
+                self.algorithm = "RS256"
+        logger.info(f"Initialized JWT signing with {self.algorithm}")
+
+    def _load_rsa_keys(self):
+        """Load RSA private and public keys from files"""
+        try:
+            with open(self.private_key_path, "rb") as f:
+                self.private_key = serialization.load_pem_private_key(f.read(), password=None)
+
+            with open(self.public_key_path, "rb") as f:
+                self.public_key = serialization.load_pem_public_key(f.read())
+
+            with open(self.public_key_path) as f:
+                self.public_key_pem = f.read()
+
+        except FileNotFoundError as e:
+            raise Exception(f"RSA key files not found: {e}") from e
+        except Exception as e:
+            raise Exception(f"Failed to load RSA keys: {e}") from e
+
+    async def get_user_info_from_token(self, access_token: str) -> dict[str, Any] | None:
+        """Get user info from Google using access token"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    "https://www.googleapis.com/oauth2/v2/userinfo",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(
+                    "Failed to get user info",
+                    status_code=response.status_code,
+                    response_text=response.text,
+                )
+                return None
+
+        except Exception as e:
+            logger.error("Error getting user info", error=str(e))
+            return None
+
+    async def create_user_session(self, access_token: str, issuer: str) -> str | None:
+        """Create user session from OAuth access token"""
+        user_info = await self.get_user_info_from_token(access_token)
+        if not user_info:
+            return None
+
+        # Create or update user
+        user_id = user_info["id"]
+        user = User(
+            user_id=user_id,
+            email=user_info["email"],
+            name=user_info["name"],
+            picture=user_info.get("picture"),
+            provider="google",
+        )
+
+        # Update last login if user exists
+        if user_id in self.users:
+            self.users[user_id].last_login = datetime.now()
+        else:
+            self.users[user_id] = user
+
+        # Create JWT token using the shared method
+        return self.create_jwt_token(user)
+
+    def _get_oidc_issuer(self) -> str:
+        # Use OpenSearch-compatible issuer for OIDC validation
+        from config.settings import OPENRAG_BACKEND_PORT, OPENRAG_FQDN
+
+        oidc_issuer = f"http://openrag-backend:{OPENRAG_BACKEND_PORT}"
+        if OPENRAG_FQDN:
+            oidc_issuer = f"http://{OPENRAG_FQDN}:{OPENRAG_BACKEND_PORT}"
+        return oidc_issuer
+
+    def _create_signed_jwt_token(
+        self,
+        user: User,
+        *,
+        expires_delta: timedelta,
+    ) -> str:
+        # Create JWT token with OIDC-compliant claims
+        now = datetime.now(UTC)
+        roles = ["openrag_user"]
+        token_payload = {
+            # OIDC standard claims
+            "iss": self._get_oidc_issuer(),  # Fixed issuer for OpenSearch OIDC
+            "sub": user.user_id,  # Subject (user ID)
+            "aud": ["opensearch", "openrag"],  # Audience
+            "exp": now + expires_delta,  # Expiration
+            "iat": now,  # Issued at
+            "auth_time": int(now.timestamp()),  # Authentication time
+            # Custom claims
+            "user_id": user.user_id,  # Keep for backward compatibility
+            "email": user.email,
+            "name": user.name,
+            "preferred_username": user.email,
+            "email_verified": True,
+            "roles": roles,  # Backend roles for OpenSearch
+            "user_roles": roles + ["all_access"],  # compatible with OpenSearch's roles_key
+        }
+
+        if self.private_key is None:
+            logger.error("JWT signing requested but signing is disabled")
+            return None
+        token = jwt.encode(token_payload, self.private_key, algorithm=self.algorithm)
+        return f"Bearer {token}"
+
+    def create_jwt_token(self, user: User) -> str:
+        """Create the long-lived OpenRAG session JWT for an existing user."""
+        return self._create_signed_jwt_token(
+            user,
+            expires_delta=timedelta(days=7),
+        )
+
+    def create_opensearch_jwt_token(
+        self,
+        user: User,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        """Create a short-lived OpenSearch JWT for user-scoped OpenSearch requests."""
+        if ttl_seconds is None:
+            from config.settings import get_opensearch_jwt_ttl_seconds
+
+            ttl_seconds = get_opensearch_jwt_ttl_seconds()
+        return self._create_signed_jwt_token(
+            user,
+            expires_delta=timedelta(seconds=max(ttl_seconds, 1)),
+        )
+
+    def verify_token(self, token: str) -> dict[str, Any] | None:
+        """Verify JWT token and return decoded claims, using an in-process cache."""
+        if IBM_AUTH_ENABLED:
+            return None
+        scheme, _, value = token.partition(" ")
+        raw = value if scheme.lower() == "bearer" and value else token
+
+        cached = _JWT_CLAIMS_CACHE.get(raw)
+        if cached is not None:
+            if cached.get("exp", 0) > time.time():
+                return cached
+            _JWT_CLAIMS_CACHE.pop(raw, None)  # evict immediately on stale hit
+
+        try:
+            payload = jwt.decode(
+                raw,
+                self.public_key,
+                algorithms=[self.algorithm],
+                audience=["opensearch", "openrag"],
+            )
+            _JWT_CLAIMS_CACHE[raw] = payload
+            return payload
+        except jwt.ExpiredSignatureError:
+            return None
+        except jwt.InvalidTokenError:
+            return None
+
+    def get_user(self, user_id: str) -> User | None:
+        """Get user by ID"""
+        if user_id == "anonymous":
+            return AnonymousUser()
+        return self.users.get(user_id)
+
+    def get_user_from_token(self, token: str) -> User | None:
+        """Get user from JWT token"""
+        payload = self.verify_token(token)
+        if payload:
+            return self.get_user(payload["user_id"])
+        return None
+
+    def get_user_opensearch_client(self, user_or_id: User | str, jwt_token: str = None):
+        """Get or create OpenSearch client for user with their JWT"""
+        if isinstance(user_or_id, User):
+            user_id = user_or_id.user_id
+            jwt_token = user_or_id.jwt_token
+        else:
+            user_id = user_or_id
+
+        provided_jwt_token = jwt_token
+
+        # Get the effective JWT token (handles anonymous JWT creation)
+        jwt_token = self.get_effective_jwt_token(user_id, jwt_token)
+
+        from config.settings import clients
+
+        # Upstream credentials may rotate per request.
+        if IBM_AUTH_ENABLED:
+            return clients.create_user_opensearch_client(jwt_token)
+
+        if provided_jwt_token:
+            token_hash = hashlib.sha256(jwt_token.encode("utf-8")).hexdigest()
+            cache_key = f"{user_id}:{token_hash}"
+        else:
+            cache_key = user_id or "anonymous"
+
+        if cache_key not in self.user_opensearch_clients:
+            self.user_opensearch_clients[cache_key] = clients.create_user_opensearch_client(
+                jwt_token
+            )
+
+        return self.user_opensearch_clients[cache_key]
+
+    def get_effective_jwt_token(self, user_id: str, jwt_token: str) -> str:
+        """Get the effective JWT token, creating anonymous JWT if needed in no-auth mode"""
+        from config.settings import is_no_auth_mode
+
+        # Upstream JWT is used as-is; never override it with an anonymous token.
+        if IBM_AUTH_ENABLED and jwt_token:
+            return jwt_token
+
+        if jwt_token is not None and isinstance(jwt_token, str) and jwt_token.strip():
+            return jwt_token
+
+        # No token — create one
+        if is_no_auth_mode() or user_id in (None, AnonymousUser().user_id):
+            # No anonymous JWT concept when local signing is disabled.
+            if self.private_key is None:
+                return None
+            # anonymous JWT (cached)
+            if not hasattr(self, "_anonymous_jwt"):
+                self._anonymous_jwt = self._create_anonymous_jwt()
+            return self._anonymous_jwt
+
+        # Auth mode, real user, no token — mint a JWT for them
+        user = self.get_user(user_id)
+        if user:
+            return self.create_jwt_token(user)
+
+        return None
+
+    def _create_anonymous_jwt(self) -> str:
+        """Create JWT token for anonymous user in no-auth mode"""
+        anonymous_user = AnonymousUser()
+        return self.create_jwt_token(anonymous_user)

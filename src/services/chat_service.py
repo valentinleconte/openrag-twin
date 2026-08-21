@@ -1,0 +1,1007 @@
+import json
+from typing import Any
+
+from agent import async_chat, async_chat_stream, async_langflow
+from auth_context import set_auth_context
+from config.settings import LANGFLOW_CHAT_FLOW_ID, LANGFLOW_URL, NUDGES_FLOW_ID, clients
+from utils.langflow_utils import fence_untrusted_text
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+
+class ChatService:
+    def __init__(self, flows_service=None):
+        self.flows_service = flows_service
+
+    async def chat(
+        self,
+        prompt: str,
+        user_id: str = None,
+        jwt_token: str = None,
+        previous_response_id: str = None,
+        stream: bool = False,
+        filter_id: str = None,
+        storage_user_id: str = None,
+    ):
+        """Handle chat requests using the patched OpenAI client"""
+        if not prompt:
+            raise ValueError("Prompt is required")
+        conversation_user_id = storage_user_id or user_id
+
+        # Set authentication context for this request so tools can access it
+        if user_id and jwt_token:
+            set_auth_context(user_id, jwt_token)
+
+        if stream:
+            return async_chat_stream(
+                clients.patched_llm_client,
+                prompt,
+                conversation_user_id,
+                previous_response_id=previous_response_id,
+                filter_id=filter_id,
+            )
+        else:
+            response_text, response_id = await async_chat(
+                clients.patched_llm_client,
+                prompt,
+                conversation_user_id,
+                previous_response_id=previous_response_id,
+                filter_id=filter_id,
+            )
+            response_data = {"response": response_text}
+            if response_id:
+                response_data["response_id"] = response_id
+            return response_data
+
+    async def langflow_chat(
+        self,
+        prompt: str,
+        user_id: str = None,
+        jwt_token: str = None,
+        previous_response_id: str = None,
+        conversation_id: str = None,
+        stream: bool = False,
+        filter_id: str = None,
+        owner: str = None,
+        owner_name: str = None,
+        owner_email: str = None,
+        storage_user_id: str = None,
+    ):
+        """Handle Langflow chat requests"""
+        if not prompt:
+            raise ValueError("Prompt is required")
+        conversation_user_id = storage_user_id or user_id
+
+        if not LANGFLOW_URL or not LANGFLOW_CHAT_FLOW_ID:
+            raise ValueError(
+                "LANGFLOW_URL and LANGFLOW_CHAT_FLOW_ID environment variables are required"
+            )
+
+        # Prepare extra headers for JWT authentication and embedding model.
+        # NOTE: extra_headers accumulates raw secrets (JWT, provider API keys —
+        # see add_provider_credentials_to_headers below). Never log this dict or
+        # pass it to a logger call (e.g. logger.info(..., extra_headers=...)).
+        extra_headers = {}
+        if jwt_token:
+            extra_headers["X-LANGFLOW-GLOBAL-VAR-JWT"] = jwt_token
+
+        # Pass the selected embedding model as a global variable
+        from config.settings import get_openrag_config
+        from utils.langflow_headers import (
+            add_provider_credentials_to_headers,
+            build_model_provider_headers,
+        )
+
+        config = get_openrag_config()
+        embedding_model = config.knowledge.embedding_model
+        chunk_size = getattr(config.knowledge, "chunk_size", 1000)
+        chunk_overlap = getattr(config.knowledge, "chunk_overlap", 200)
+        extra_headers.update(build_model_provider_headers(config))
+
+        # Configure ingest callback credentials/vars like ingestion does
+        import uuid
+
+        from config.settings import (
+            LANGFLOW_INGEST_CALLBACK_BATCH_SIZE,
+            get_index_name,
+            get_ingest_callback_url,
+        )
+        from services.document_index_writer import DocumentIndexContext
+        from services.langflow_ingest_token_service import LangflowIngestTokenService
+
+        doc_id = str(uuid.uuid4())
+        ingest_run_id = f"{doc_id}-{uuid.uuid4().hex}"
+        context = DocumentIndexContext(
+            document_id=doc_id,
+            filename="",
+            mimetype="",
+            embedding_model=embedding_model,
+            owner=owner,
+            owner_name=owner_name,
+            owner_email=owner_email,
+            file_size=0,
+            connector_type="url",
+            source_url=None,
+            allowed_users=[],
+            allowed_groups=[],
+            allowed_principals=[],
+            allowed_principal_labels=[],
+            ingest_run_id=ingest_run_id,
+            is_sample_data=False,
+            index_name=get_index_name(),
+            parser="URL Ingester",
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        token_service = LangflowIngestTokenService()
+        ingest_token = token_service.create_token(context)
+
+        extra_headers["X-Langflow-Global-Var-OPENRAG_INGEST_URL"] = get_ingest_callback_url()
+        extra_headers["X-Langflow-Global-Var-OPENRAG_INGEST_TOKEN"] = ingest_token
+        extra_headers["X-Langflow-Global-Var-OPENRAG_INGEST_RUN_ID"] = ingest_run_id
+        extra_headers["X-Langflow-Global-Var-OPENRAG_INGEST_BATCH_SIZE"] = str(
+            LANGFLOW_INGEST_CALLBACK_BATCH_SIZE
+        )
+        extra_headers["X-Langflow-Global-Var-CONNECTOR_TYPE"] = "url"
+
+        # Add provider credentials to headers
+        await add_provider_credentials_to_headers(
+            extra_headers, config, flows_service=self.flows_service, jwt_token=jwt_token
+        )
+        # Get context variables for filters, limit, and threshold
+        from auth_context import (
+            get_score_threshold,
+            get_search_filters,
+            get_search_limit,
+        )
+
+        filters = get_search_filters()
+        limit = get_search_limit()
+        score_threshold = get_score_threshold()
+
+        # Build the complete filter expression like the search service does
+        filter_expression: dict[str, Any] = {}
+        if filters:
+            filter_clauses = []
+            # Map frontend filter names to backend field names
+            field_mapping = {
+                "data_sources": "filename",
+                "document_types": "mimetype",
+                "owners": "owner",
+                "connector_types": "connector_type",
+            }
+
+            for filter_key, values in filters.items():
+                if values is not None and isinstance(values, list) and len(values) > 0:
+                    # Map frontend key to backend field name
+                    field_name = field_mapping.get(filter_key, filter_key)
+
+                    if len(values) == 1:
+                        # Single value filter
+                        filter_clauses.append({"term": {field_name: values[0]}})
+                    else:
+                        # Multiple values filter
+                        filter_clauses.append({"terms": {field_name: values}})
+
+            if filter_clauses:
+                filter_expression["filter"] = filter_clauses
+
+        # Add limit and score threshold to the filter expression (only if different from defaults)
+        if limit and limit != 10:  # 10 is the default limit
+            filter_expression["limit"] = limit
+
+        if score_threshold and score_threshold != 0:  # 0 is the default threshold
+            filter_expression["score_threshold"] = score_threshold
+
+        # Pass the complete filter expression as a single header to Langflow (only if we have something to send)
+        logger.info(
+            "Sending OpenRAG query filter to Langflow",
+            filter_expression=filter_expression,
+        )
+        extra_headers["X-LANGFLOW-GLOBAL-VAR-OPENRAG-QUERY-FILTER"] = json.dumps(filter_expression)
+        logger.info(
+            "[CHAT] Langflow chat request", stream=stream, filters_applied=bool(filter_expression)
+        )
+        # Ensure the Langflow client exists; try lazy init if needed
+        langflow_client = await clients.ensure_langflow_client()
+        if not langflow_client:
+            raise ValueError(
+                "Langflow client not initialized. Ensure LANGFLOW is reachable or set LANGFLOW_KEY."
+            )
+
+        if stream:
+            from agent import async_langflow_chat_stream
+
+            return async_langflow_chat_stream(
+                langflow_client,
+                LANGFLOW_CHAT_FLOW_ID,
+                prompt,
+                conversation_user_id,
+                extra_headers=extra_headers,
+                previous_response_id=previous_response_id,
+                conversation_id=conversation_id,
+                filter_id=filter_id,
+            )
+        else:
+            from agent import async_langflow_chat
+
+            response_text, response_id, sources = await async_langflow_chat(
+                langflow_client,
+                LANGFLOW_CHAT_FLOW_ID,
+                prompt,
+                conversation_user_id,
+                extra_headers=extra_headers,
+                previous_response_id=previous_response_id,
+                conversation_id=conversation_id,
+                filter_id=filter_id,
+            )
+            response_data = {"response": response_text}
+            if response_id:
+                response_data["response_id"] = response_id
+            if sources:
+                response_data["sources"] = sources
+            return response_data
+
+    async def langflow_nudges_chat(
+        self,
+        user_id: str = None,
+        jwt_token: str = None,
+        previous_response_id: str = None,
+        filters: dict = None,
+        limit: int = None,
+        score_threshold: float = None,
+        storage_user_id: str = None,
+    ):
+        """Handle Langflow nudges chat requests with knowledge filters"""
+        conversation_user_id = storage_user_id or user_id
+
+        if not LANGFLOW_URL or not NUDGES_FLOW_ID:
+            raise ValueError("LANGFLOW_URL and NUDGES_FLOW_ID environment variables are required")
+
+        # Prepare extra headers for JWT authentication and embedding model.
+        # NOTE: extra_headers accumulates raw secrets (JWT, provider API keys —
+        # see add_provider_credentials_to_headers below). Never log this dict or
+        # pass it to a logger call (e.g. logger.info(..., extra_headers=...)).
+        extra_headers = {}
+        if jwt_token:
+            extra_headers["X-LANGFLOW-GLOBAL-VAR-JWT"] = jwt_token
+
+        from config.settings import get_openrag_config
+        from utils.langflow_headers import (
+            add_provider_credentials_to_headers,
+            build_model_provider_headers,
+        )
+
+        config = get_openrag_config()
+        extra_headers.update(build_model_provider_headers(config))
+
+        # Add provider credentials to headers
+        await add_provider_credentials_to_headers(
+            extra_headers, config, flows_service=self.flows_service, jwt_token=jwt_token
+        )
+
+        # Build the complete filter expression like the chat service does
+        filter_expression: dict[str, Any] = {}
+        has_user_filters = False
+        filter_clauses = []
+
+        if filters:
+            # Map frontend filter names to backend field names
+            field_mapping = {
+                "data_sources": "filename",
+                "document_types": "mimetype",
+                "owners": "owner",
+                "connector_types": "connector_type",
+            }
+
+            for filter_key, values in filters.items():
+                if values is not None and isinstance(values, list) and len(values) > 0:
+                    # Map frontend key to backend field name
+                    field_name = field_mapping.get(filter_key, filter_key)
+
+                    if len(values) == 1:
+                        # Single value filter
+                        filter_clauses.append({"term": {field_name: values[0]}})
+                    else:
+                        # Multiple values filter
+                        filter_clauses.append({"terms": {field_name: values}})
+
+            if filter_clauses:
+                has_user_filters = True
+
+        # If no user filters are active, exclude sample data from nudges
+        if not has_user_filters:
+            # Add a bool query with must_not to exclude sample data
+            filter_clauses.append({"bool": {"must_not": [{"term": {"is_sample_data": "true"}}]}})
+            logger.info("Excluding sample data from nudges (no user filters active)")
+
+        # Set the filter clauses if we have any
+        if filter_clauses:
+            filter_expression["filter"] = filter_clauses
+
+        # Add limit and score threshold to the filter expression (only if different from defaults)
+        if limit and limit != 10:  # 10 is the default limit
+            filter_expression["limit"] = limit
+
+        if score_threshold and score_threshold != 0:  # 0 is the default threshold
+            filter_expression["score_threshold"] = score_threshold
+
+        # Pass the complete filter expression as a single header to Langflow (only if we have something to send)
+        extra_headers["X-LANGFLOW-GLOBAL-VAR-OPENRAG-QUERY-FILTER"] = json.dumps(filter_expression)
+        logger.info("[CHAT] Nudges request", filters_applied=bool(filter_expression))
+
+        # Ensure the Langflow client exists; try lazy init if needed
+        langflow_client = await clients.ensure_langflow_client()
+        if not langflow_client:
+            raise ValueError(
+                "Langflow client not initialized. Ensure LANGFLOW is reachable or set LANGFLOW_KEY."
+            )
+        prompt = ""
+        if previous_response_id:
+            messages = []
+            # Try in-memory active conversation first
+            from agent import active_conversations
+
+            if (
+                conversation_user_id in active_conversations
+                and previous_response_id in active_conversations[conversation_user_id]
+            ):
+                messages = active_conversations[conversation_user_id][previous_response_id].get(
+                    "messages", []
+                )
+
+            # Filter out system messages
+            user_ast_messages = [m for m in messages if m.get("role") in ["user", "assistant"]]
+
+            # If no history in memory, try fetching from Langflow persistent history
+            if not user_ast_messages:
+                from services.langflow_history_service import langflow_history_service
+
+                try:
+                    lf_messages = await langflow_history_service.get_session_messages(
+                        conversation_user_id, previous_response_id
+                    )
+                    if lf_messages:
+                        messages = lf_messages
+                        user_ast_messages = [
+                            m for m in messages if m.get("role") in ["user", "assistant"]
+                        ]
+                except Exception as e:
+                    logger.warning(f"Failed to fetch session messages for nudges: {e}")
+
+            if user_ast_messages:
+                # Return at max 8 messages (the last ones)
+                user_ast_messages = user_ast_messages[-8:]
+
+                formatted_messages = []
+
+                def trim_results(r, depth=0):
+                    MAX_DEPTH = 3
+                    MAX_LIST_LEN = 3
+                    MAX_DICT_KEYS = 5
+                    MAX_STR_LEN = 1000
+
+                    if isinstance(r, str):
+                        return r[:MAX_STR_LEN] + ("..." if len(r) > MAX_STR_LEN else "")
+                    elif isinstance(r, list):
+                        if depth >= MAX_DEPTH:
+                            return "[Max depth reached]"
+                        return [trim_results(x, depth + 1) for x in r[:MAX_LIST_LEN]]
+                    elif isinstance(r, dict):
+                        if depth >= MAX_DEPTH:
+                            return "[Max depth reached]"
+                        trimmed = {}
+                        for i, (k, v) in enumerate(r.items()):
+                            if i >= MAX_DICT_KEYS:
+                                trimmed["_more_keys"] = f"... ({len(r) - MAX_DICT_KEYS} omitted)"
+                                break
+                            trimmed[k] = trim_results(v, depth + 1)
+                        return trimmed
+                    return r
+
+                for msg in user_ast_messages:
+                    role = msg.get("role")
+                    content = msg.get("content", "")
+                    msg_str = f"{role}: {content}"
+
+                    # Extract tool calls and chunks if this is an assistant message
+                    if role == "assistant":
+                        extracted_chunks = []
+
+                        # 1. From chunks list
+                        chunks = msg.get("chunks") or []
+                        if isinstance(chunks, list):
+                            last_tc = None
+                            for chunk in chunks:
+                                if isinstance(chunk, dict):
+                                    item = chunk.get("item", {})
+                                    if isinstance(item, dict) and item.get("type") in [
+                                        "tool_call",
+                                        "retrieval_call",
+                                    ]:
+                                        t_name = item.get("tool_name") or item.get("name") or "tool"
+                                        res = trim_results(item.get("results"))
+                                        tc = {"tool_name": t_name, "results": res}
+                                        extracted_chunks.append(tc)
+                                        last_tc = tc
+                                    elif chunk.get("type") in [
+                                        "response.tool_call.result",
+                                        "tool_call_result",
+                                    ]:
+                                        res = trim_results(chunk.get("result") or chunk)
+                                        if last_tc:
+                                            last_tc["results"] = res
+                                        else:
+                                            extracted_chunks.append(
+                                                {"tool_name": "tool", "results": res}
+                                            )
+
+                        # 2. From response_data dict/string
+                        resp_data = msg.get("response_data")
+                        if resp_data:
+                            if isinstance(resp_data, str):
+                                try:
+                                    resp_data = json.loads(resp_data)
+                                except Exception:
+                                    resp_data = {}
+                            if isinstance(resp_data, dict):
+                                t_calls = resp_data.get("tool_calls") or []
+                                if isinstance(t_calls, list):
+                                    for tc in t_calls:
+                                        if isinstance(tc, dict):
+                                            t_name = tc.get("name")
+                                            func = tc.get("function")
+                                            if isinstance(func, dict) and not t_name:
+                                                t_name = func.get("name")
+                                            res = trim_results(tc.get("result"))
+                                            extracted_chunks.append(
+                                                {"tool_name": t_name or "tool", "results": res}
+                                            )
+
+                        if extracted_chunks:
+                            chunks_strs = []
+                            for tc in extracted_chunks:
+                                t_name = tc.get("tool_name", "tool")
+                                res = tc.get("results")
+                                if res is not None:
+                                    res_str = json.dumps(res, ensure_ascii=False, default=str)
+                                    chunks_strs.append(f"[Tool: {t_name}, Results: {res_str}]")
+                            if chunks_strs:
+                                msg_str += "\nContext Chunks:\n" + "\n".join(chunks_strs)
+
+                    formatted_messages.append(msg_str)
+
+                prompt = "\n\n".join(formatted_messages)
+
+        from agent import async_langflow_chat
+
+        response_text, response_id, _sources = await async_langflow_chat(
+            langflow_client,
+            NUDGES_FLOW_ID,
+            prompt,
+            conversation_user_id,
+            extra_headers=extra_headers,
+            store_conversation=False,
+        )
+        response_data = {"response": response_text}
+        if response_id:
+            response_data["response_id"] = response_id
+        return response_data
+
+    async def upload_context_chat(
+        self,
+        document_content: str,
+        filename: str,
+        user_id: str = None,
+        jwt_token: str = None,
+        previous_response_id: str = None,
+        endpoint: str = "langflow",
+        owner: str = None,
+        owner_name: str = None,
+        owner_email: str = None,
+        storage_user_id: str = None,
+    ):
+        """Send document content as user message to get proper response_id"""
+        document_prompt = (
+            f"I'm uploading a document called '{filename}'. Here is its content:\n\n"
+            f"{fence_untrusted_text(document_content)}\n\n"
+            "Please confirm you've received this document and are ready to answer questions about it."
+        )
+        conversation_user_id = storage_user_id or user_id
+
+        if endpoint == "langflow":
+            # Prepare extra headers for JWT authentication and embedding model.
+            # NOTE: extra_headers accumulates raw secrets (JWT, provider API keys).
+            # Never log this dict or pass it to a logger call
+            # (e.g. logger.info(..., extra_headers=...)).
+            extra_headers = {}
+            if jwt_token:
+                extra_headers["X-LANGFLOW-GLOBAL-VAR-JWT"] = jwt_token
+
+            from config.settings import get_openrag_config
+            from utils.langflow_headers import (
+                add_provider_credentials_to_headers,
+                build_model_provider_headers,
+            )
+
+            config = get_openrag_config()
+            embedding_model = config.knowledge.embedding_model
+            chunk_size = getattr(config.knowledge, "chunk_size", 1000)
+            chunk_overlap = getattr(config.knowledge, "chunk_overlap", 200)
+            extra_headers.update(build_model_provider_headers(config))
+
+            # Configure ingest callback credentials/vars like ingestion does
+            import uuid
+
+            from config.settings import (
+                LANGFLOW_INGEST_CALLBACK_BATCH_SIZE,
+                get_index_name,
+                get_ingest_callback_url,
+            )
+            from services.document_index_writer import DocumentIndexContext
+            from services.langflow_ingest_token_service import LangflowIngestTokenService
+
+            doc_id = str(uuid.uuid4())
+            ingest_run_id = f"{doc_id}-{uuid.uuid4().hex}"
+            context = DocumentIndexContext(
+                document_id=doc_id,
+                filename="",
+                mimetype="",
+                embedding_model=embedding_model,
+                owner=owner,
+                owner_name=owner_name,
+                owner_email=owner_email,
+                file_size=0,
+                connector_type="url",
+                source_url=None,
+                allowed_users=[],
+                allowed_groups=[],
+                allowed_principals=[],
+                allowed_principal_labels=[],
+                ingest_run_id=ingest_run_id,
+                is_sample_data=False,
+                index_name=get_index_name(),
+                parser="URL Ingester",
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+            token_service = LangflowIngestTokenService()
+            ingest_token = token_service.create_token(context)
+
+            extra_headers["X-Langflow-Global-Var-OPENRAG_INGEST_URL"] = get_ingest_callback_url()
+            extra_headers["X-Langflow-Global-Var-OPENRAG_INGEST_TOKEN"] = ingest_token
+            extra_headers["X-Langflow-Global-Var-OPENRAG_INGEST_RUN_ID"] = ingest_run_id
+            extra_headers["X-Langflow-Global-Var-OPENRAG_INGEST_BATCH_SIZE"] = str(
+                LANGFLOW_INGEST_CALLBACK_BATCH_SIZE
+            )
+            extra_headers["X-Langflow-Global-Var-CONNECTOR_TYPE"] = "url"
+
+            # Add provider credentials to headers
+            await add_provider_credentials_to_headers(
+                extra_headers, config, flows_service=self.flows_service, jwt_token=jwt_token
+            )
+
+            # Ensure the Langflow client exists; try lazy init if needed
+            langflow_client = await clients.ensure_langflow_client()
+            if not langflow_client:
+                raise ValueError(
+                    "Langflow client not initialized. Ensure LANGFLOW is reachable or set LANGFLOW_KEY."
+                )
+
+            response_text, response_id = await async_langflow(
+                langflow_client=langflow_client,
+                flow_id=LANGFLOW_CHAT_FLOW_ID,
+                prompt=document_prompt,
+                extra_headers=extra_headers,
+                previous_response_id=previous_response_id,
+            )
+        else:  # chat
+            # Set auth context for chat tools and provide user_id
+            if user_id and jwt_token:
+                set_auth_context(user_id, jwt_token)
+            response_text, response_id = await async_chat(
+                clients.patched_llm_client,
+                document_prompt,
+                conversation_user_id,
+                previous_response_id=previous_response_id,
+            )
+
+        return response_text, response_id
+
+    async def get_chat_history(self, user_id: str):
+        """Get chat conversation history for a user"""
+        from agent import active_conversations, get_user_conversations
+
+        if not user_id:
+            return {"error": "User ID is required", "conversations": []}
+
+        # Get metadata from persistent storage
+        conversations_dict = await get_user_conversations(user_id)
+
+        # Get in-memory conversations (with function calls)
+        in_memory_conversations = active_conversations.get(user_id, {})
+
+        logger.debug(
+            "Getting chat history for user",
+            user_id=user_id,
+            persistent_count=len(conversations_dict),
+            in_memory_count=len(in_memory_conversations),
+        )
+
+        # Convert conversations dict to list format with metadata
+        conversations = []
+
+        # First, process in-memory conversations (they have function calls)
+        for response_id, conversation_state in in_memory_conversations.items():
+            # Filter out system messages
+            messages = []
+            for msg in conversation_state.get("messages", []):
+                if msg.get("role") in ["user", "assistant"]:
+                    message_data = {
+                        "role": msg["role"],
+                        "content": msg["content"],
+                        "timestamp": msg.get("timestamp").isoformat()
+                        if msg.get("timestamp")
+                        else None,
+                    }
+                    if msg.get("response_id"):
+                        message_data["response_id"] = msg["response_id"]
+
+                    # Include function call data if present
+                    if msg.get("chunks"):
+                        message_data["chunks"] = msg["chunks"]
+                    if msg.get("response_data"):
+                        message_data["response_data"] = msg["response_data"]
+
+                    messages.append(message_data)
+
+            if messages:  # Only include conversations with actual messages
+                # Generate title from first user message
+                first_user_msg = next((msg for msg in messages if msg["role"] == "user"), None)
+                title = (
+                    first_user_msg["content"][:50] + "..."
+                    if first_user_msg and len(first_user_msg["content"]) > 50
+                    else first_user_msg["content"]
+                    if first_user_msg
+                    else "New chat"
+                )
+
+                conversations.append(
+                    {
+                        "response_id": response_id,
+                        "title": title,
+                        "endpoint": "chat",
+                        "messages": messages,
+                        "created_at": conversation_state.get("created_at").isoformat()
+                        if conversation_state.get("created_at")
+                        else None,
+                        "last_activity": conversation_state.get("last_activity").isoformat()
+                        if conversation_state.get("last_activity")
+                        else None,
+                        "previous_response_id": conversation_state.get("previous_response_id"),
+                        "filter_id": conversation_state.get("filter_id"),
+                        "total_messages": len(messages),
+                        "source": "in_memory",
+                    }
+                )
+
+        # Then, add any persistent metadata that doesn't have in-memory data
+        for response_id, metadata in conversations_dict.items():
+            if response_id not in in_memory_conversations:
+                # This is metadata-only conversation (no function calls)
+                conversations.append(
+                    {
+                        "response_id": response_id,
+                        "title": metadata.get("title", "New Chat"),
+                        "endpoint": "chat",
+                        "messages": [],  # No messages in metadata-only
+                        "created_at": metadata.get("created_at"),
+                        "last_activity": metadata.get("last_activity"),
+                        "previous_response_id": metadata.get("previous_response_id"),
+                        "filter_id": metadata.get("filter_id"),
+                        "total_messages": metadata.get("total_messages", 0),
+                        "source": "metadata_only",
+                    }
+                )
+
+        # Sort by last activity (most recent first)
+        conversations.sort(key=lambda c: c.get("last_activity", ""), reverse=True)
+
+        return {
+            "user_id": user_id,
+            "endpoint": "chat",
+            "conversations": conversations,
+            "total_conversations": len(conversations),
+        }
+
+    @staticmethod
+    def _messages_from_active_conversation(conversation_state: dict) -> list[dict]:
+        """Serialize in-memory OpenRAG thread messages for the history API."""
+        messages = []
+        for msg in conversation_state.get("messages", []):
+            if msg.get("role") not in ["user", "assistant"]:
+                continue
+            message_data = {
+                "role": msg["role"],
+                "content": msg["content"],
+                "timestamp": msg.get("timestamp").isoformat()
+                if hasattr(msg.get("timestamp"), "isoformat")
+                else msg.get("timestamp"),
+                "source": "openrag_memory",
+            }
+            if msg.get("error"):
+                message_data["error"] = True
+            if msg.get("chunks"):
+                message_data["chunks"] = msg["chunks"]
+            if msg.get("response_data"):
+                message_data["response_data"] = msg["response_data"]
+            messages.append(message_data)
+        return messages
+
+    async def get_langflow_history(self, user_id: str):
+        """Get langflow conversation history for a user - now fetches from both OpenRAG memory and Langflow database"""
+        from agent import active_conversations, get_user_conversations
+        from services.langflow_history_service import langflow_history_service
+
+        if not user_id:
+            return {"error": "User ID is required", "conversations": []}
+
+        all_conversations = []
+        local_metadata: dict = {}
+        in_memory = active_conversations.get(user_id, {})
+
+        try:
+            # 1. Get local conversation metadata (no actual messages stored here)
+            conversations_dict = await get_user_conversations(user_id)
+
+            for response_id, conversation_metadata in conversations_dict.items():
+                # Store metadata for later use with Langflow data
+                local_metadata[response_id] = conversation_metadata
+
+            # 2. Get actual conversations from Langflow database (source of truth for messages)
+            logger.debug(f"Attempting to fetch Langflow history for user: {user_id}")
+            langflow_history = await langflow_history_service.get_user_conversation_history(
+                user_id, flow_id=LANGFLOW_CHAT_FLOW_ID
+            )
+
+            if langflow_history.get("conversations"):
+                for conversation in langflow_history["conversations"]:
+                    session_id = conversation["session_id"]
+
+                    # Only process sessions that belong to this user (exist in local metadata)
+                    if session_id not in local_metadata:
+                        continue
+
+                    # Use Langflow messages (with function calls) as source of truth
+                    messages = []
+                    for msg in conversation.get("messages", []):
+                        message_data = {
+                            "role": msg["role"],
+                            "content": msg["content"],
+                            "timestamp": msg.get("timestamp"),
+                            "langflow_message_id": msg.get("langflow_message_id"),
+                            "source": "langflow",
+                        }
+
+                        if msg.get("error"):
+                            message_data["error"] = True
+
+                        # Include function call data if present
+                        if msg.get("chunks"):
+                            message_data["chunks"] = msg["chunks"]
+                        if msg.get("response_data"):
+                            message_data["response_data"] = msg["response_data"]
+
+                        messages.append(message_data)
+
+                    # Prefer OpenRAG memory when it has more turns (error retries use a
+                    # fresh Langflow session under the same OpenRAG thread id).
+                    memory_messages = self._messages_from_active_conversation(
+                        in_memory.get(session_id, {})
+                    )
+                    if len(memory_messages) > len(messages):
+                        messages = memory_messages
+                        source = "openrag_memory_preferred"
+                    else:
+                        source = "langflow_enhanced"
+
+                    if messages:
+                        metadata = local_metadata.get(session_id, {})
+                        first_user_msg = next(
+                            (msg for msg in messages if msg["role"] == "user"), None
+                        )
+                        title = metadata.get("title") or (
+                            first_user_msg["content"][:50] + "..."
+                            if first_user_msg and len(first_user_msg["content"]) > 50
+                            else first_user_msg["content"]
+                            if first_user_msg
+                            else "Langflow chat"
+                        )
+
+                        all_conversations.append(
+                            {
+                                "response_id": session_id,
+                                "title": title,
+                                "endpoint": "langflow",
+                                "messages": messages,
+                                "created_at": metadata.get("created_at")
+                                or conversation.get("created_at"),
+                                "last_activity": metadata.get("last_activity")
+                                or conversation.get("last_activity"),
+                                "filter_id": metadata.get("filter_id"),
+                                "total_messages": len(messages),
+                                "source": source,
+                                "langflow_session_id": session_id,
+                                "langflow_flow_id": conversation.get("flow_id"),
+                            }
+                        )
+
+        except Exception as e:
+            logger.error(f"Failed to fetch Langflow history: {e}")
+
+        # Local-only threads + upgrade listed ones from memory/metadata snapshots
+        # (Langflow history is incomplete after fresh-session error retries).
+        listed_ids = {c["response_id"] for c in all_conversations}
+        for response_id, metadata in local_metadata.items():
+            conversation_state = in_memory.get(response_id, {})
+            messages = self._messages_from_active_conversation(conversation_state)
+            if not messages and isinstance(metadata.get("messages"), list):
+                messages = [
+                    m
+                    for m in metadata["messages"]
+                    if isinstance(m, dict) and m.get("role") in ["user", "assistant"]
+                ]
+
+            if response_id in listed_ids:
+                existing = next(c for c in all_conversations if c["response_id"] == response_id)
+                if len(messages) > len(existing.get("messages") or []):
+                    existing["messages"] = messages
+                    existing["total_messages"] = len(messages)
+                    existing["source"] = "openrag_memory_preferred"
+                continue
+
+            if not messages and not metadata.get("title"):
+                continue
+
+            first_user_msg = next((msg for msg in messages if msg["role"] == "user"), None)
+            title = metadata.get("title") or (
+                first_user_msg["content"][:50] + "..."
+                if first_user_msg and len(first_user_msg["content"]) > 50
+                else first_user_msg["content"]
+                if first_user_msg
+                else "New Chat"
+            )
+            created_at = metadata.get("created_at") or conversation_state.get("created_at")
+            last_activity = metadata.get("last_activity") or conversation_state.get("last_activity")
+            all_conversations.append(
+                {
+                    "response_id": response_id,
+                    "title": title,
+                    "endpoint": "langflow",
+                    "messages": messages,
+                    "created_at": created_at.isoformat()
+                    if hasattr(created_at, "isoformat")
+                    else created_at,
+                    "last_activity": last_activity.isoformat()
+                    if hasattr(last_activity, "isoformat")
+                    else last_activity,
+                    "filter_id": metadata.get("filter_id") or conversation_state.get("filter_id"),
+                    "total_messages": len(messages) or metadata.get("total_messages", 0),
+                    "source": "local_error_fallback",
+                }
+            )
+
+        # Sort by last activity (most recent first)
+        all_conversations.sort(key=lambda c: c.get("last_activity", ""), reverse=True)
+
+        logger.debug(
+            "[CHAT] Returning conversations",
+            total=len(all_conversations),
+            from_local_metadata=len(local_metadata),
+        )
+
+        return {
+            "user_id": user_id,
+            "endpoint": "langflow",
+            "conversations": all_conversations,
+            "total_conversations": len(all_conversations),
+        }
+
+    async def delete_session(self, user_id: str, session_id: str):
+        """Delete a session from both local storage and Langflow"""
+        try:
+            # Delete from local conversation storage
+            from agent import delete_user_conversation
+
+            local_deleted = await delete_user_conversation(user_id, session_id)
+
+            if not local_deleted:
+                return {
+                    "success": False,
+                    "not_found": True,
+                    "error": "Conversation not found",
+                }
+
+            # Delete from Langflow using the monitor API (best-effort)
+            langflow_deleted = await self._delete_langflow_session(session_id)
+
+            return {
+                "success": True,
+                "local_deleted": local_deleted,
+                "langflow_deleted": langflow_deleted,
+                "error": None,
+            }
+
+        except Exception as e:
+            logger.error(f"Error deleting session {session_id} for user {user_id}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def delete_sessions(self, user_id: str, session_ids: list[str]) -> dict[str, list[str]]:
+        """Best-effort bulk delete, any failures are returned in response + logged
+
+        Returns {"deleted": [ids], "failed": [ids]}.
+        """
+        from services.session_ownership_service import session_ownership_service
+
+        deleted: list[str] = []
+        failed: list[str] = []
+
+        for session_id in dict.fromkeys(session_ids):
+            try:
+                owner = await session_ownership_service.get_session_owner(session_id)
+                if owner != user_id:
+                    logger.warning("bulk_delete: %s not owned by %s", session_id, user_id)
+                    failed.append(session_id)
+                    continue
+
+                result = await self.delete_session(user_id, session_id)
+                if result.get("success"):
+                    deleted.append(session_id)
+                else:
+                    logger.warning("bulk_delete: %s error: %s", session_id, result.get("error"))
+                    failed.append(session_id)
+            except Exception:
+                logger.exception("bulk_delete: %s unexpected error", session_id)
+                failed.append(session_id)
+
+        return {"deleted": deleted, "failed": failed}
+
+    async def _delete_langflow_session(self, session_id: str):
+        """Delete a session from Langflow using the monitor API"""
+        try:
+            response = await clients.langflow_request(
+                "DELETE", f"/api/v1/monitor/messages/session/{session_id}"
+            )
+
+            if response.status_code == 200 or response.status_code == 204:
+                logger.info(f"Successfully deleted session {session_id} from Langflow")
+                return True
+            else:
+                logger.warning(
+                    f"Failed to delete session {session_id} from Langflow: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return False
+
+        except Exception as e:
+            logger.error(f"Error deleting session {session_id} from Langflow: {e}")
+            return False
+
+    async def delete_all_user_sessions(self, user_id: str):
+        """Delete all sessions for a user from both local storage and Langflow"""
+        from agent import get_user_conversations
+
+        conversations = await get_user_conversations(user_id)
+        session_ids = list(conversations.keys())
+
+        results = []
+        for session_id in session_ids:
+            result = await self.delete_session(user_id, session_id)
+            results.append(result)
+
+        return {
+            "success": True,
+            "deleted_count": len([r for r in results if r.get("success")]),
+            "total_count": len(session_ids),
+        }

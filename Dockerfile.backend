@@ -1,0 +1,124 @@
+# syntax=docker/dockerfile:1.4
+# BuildKit: enables cache mounts and better layer reuse.
+#
+# Build: docker build -t openrag-backend -f Dockerfile.backend .
+
+# -----------------------------------------------------------------------------
+# Stage: base (system + uv)
+# -----------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi10/python-314-minimal AS base
+
+# Install system dependencies using microdnf (UBI minimal package manager)
+USER 0
+
+
+RUN microdnf update -y \
+    && microdnf install -y \
+    ca-certificates \
+    curl \
+    openssl \
+    tar \
+    gzip \
+    && microdnf clean all \
+    && rm -rf /var/cache/yum \
+    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && python -m ensurepip --upgrade \
+    && python -m pip install --no-cache-dir --upgrade "pip>=26.1" "setuptools>=78.1.1"
+
+ENV PATH="/root/.local/bin:$PATH" \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+# -----------------------------------------------------------------------------
+# Stage: builder (deps + app)
+# -----------------------------------------------------------------------------
+FROM base AS builder
+
+# Build-time deps only (not in final image)
+RUN microdnf install -y \
+    git \
+    gcc \
+    gcc-c++ \
+    make \
+    python3.14-devel \
+    && microdnf clean all \
+    && rm -rf /var/cache/yum
+
+WORKDIR /app
+
+# Dependency layer: reuse as long as lockfile and pyproject don't change
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv,uid=0,gid=0 \
+    uv sync
+
+# Application (invalidates after deps only when src/flows change)
+COPY src/ ./src/
+COPY enhancements/ ./enhancements/
+COPY flows/ ./flows/
+COPY securityconfig/ ./securityconfig/
+COPY cloud_securityconfig/ ./cloud_securityconfig/
+# Alembic migrations — the runtime calls run_alembic_upgrade("head") on
+# startup. Without these the migration silently no-ops with
+# "alembic.ini not found; skipping schema upgrade", and the SQL DB
+# starts empty (no users / conversations / session_ownership tables).
+COPY alembic.ini ./
+COPY alembic/ ./alembic/
+COPY openrag-documents/ ./openrag-documents/
+
+# -----------------------------------------------------------------------------
+# Stage: runtime (minimal image)
+# -----------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi10/python-314-minimal AS runtime
+
+# Install runtime dependencies
+USER 0
+
+RUN microdnf update -y \
+    && microdnf install -y \
+    ca-certificates \
+    openssl \
+    shadow-utils \
+    util-linux \
+    && microdnf clean all \
+    && rm -rf /var/cache/yum \
+    && python -m ensurepip --upgrade \
+    && python -m pip install --no-cache-dir --upgrade "pip>=26.1" "setuptools>=78.1.1"
+
+# Create a non-root user/group.
+# UID/GID 1000 is the conventional first non-root account and
+# matches what Podman's :U volume flag maps to.
+RUN groupadd --gid 1000 appuser \
+    && useradd --uid 1000 --gid 1000 --no-create-home appuser
+
+WORKDIR /app
+
+# Copy files directly with non-root ownership to avoid layer duplication via chown -R
+COPY --from=builder --chown=appuser:appuser /app /app
+COPY --chown=appuser:appuser securityconfig/ ./securityconfig/
+COPY --chown=appuser:appuser cloud_securityconfig/ ./cloud_securityconfig/
+COPY --chown=appuser:appuser scripts/backend-entrypoint.sh /entrypoint.sh
+
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Pre-create every directory the app writes to at runtime so they are owned
+# by appuser in the image layer. When Docker/Podman mounts a host volume over
+# one of these paths the mount takes precedence, but the ownership baked here
+# acts as a safe default when no volume is attached (e.g. CI, unit tests).
+#
+# Writable paths:
+#   keys/              - RSA JWT keys (private_key.pem / public_key.pem)
+#   data/              - connections.json
+#   config/            - config.yaml (ConfigManager runtime settings)
+#   flows/backup/      - Langflow flow backups (flows/ itself is COPY'd from builder)
+#   openrag-documents/ - uploaded documents staging area
+RUN mkdir -p keys data config flows/backup openrag-documents \
+    && chown -R appuser:appuser keys data config flows/backup openrag-documents \
+    && chmod +x /entrypoint.sh
+
+EXPOSE 8000
+# Ingestion-callback proxy router (OPENRAG_BACKEND_ROUTER_ENABLE), when enabled.
+EXPOSE 8100
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["python", "src/main.py"]

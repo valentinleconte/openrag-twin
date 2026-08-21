@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Entrypoint for the OpenRAG Langflow container.
+
+Runs as root to correct /app/langflow-data bind-mount permissions, then drops
+to uid/gid 1000 (langflow user) before exec-ing the main process.
+
+On macOS with Podman the virtiofs layer does not faithfully propagate
+host-side chmod into the container, so permissions must be fixed from
+inside the container after the mount is established.
+"""
+
+import os
+import pathlib
+import pwd
+import sys
+
+data_dir = pathlib.Path("/app/langflow-data")
+
+try:
+    data_dir.chmod(0o777)
+except OSError:
+    pass
+
+# Look up uid 1000's passwd entry so we can restore HOME and USER correctly
+# after dropping privileges.  Running as root (USER root in Dockerfile) sets
+# HOME=/root; leaving it unchanged causes uv to try /root/.cache/uv, which
+# uid 1000 cannot write to.
+try:
+    pw = pwd.getpwuid(1000)
+    home = pw.pw_dir
+    user = pw.pw_name
+    gid = pw.pw_gid
+except KeyError:
+    home = "/app"
+    user = "langflow"
+    gid = 0
+
+# Drop from root to langflow (uid=1000, gid=gid).
+os.setgid(gid)
+os.setuid(1000)
+
+# Restore environment variables to reflect the unprivileged user.
+os.environ["HOME"] = home
+os.environ["USER"] = user
+
+# Enable SQLite WAL (Write-Ahead Logging) mode and busy timeout to handle concurrent accesses cleanly.
+try:
+    import sqlite3
+
+    db_file = data_dir / "langflow.db"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_file), timeout=10.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=60000;")
+    conn.close()
+except Exception as e:
+    sys.stderr.write(f"Warning: could not configure SQLite WAL mode: {e}\n")
+
+os.execvp(sys.argv[1], sys.argv[1:])

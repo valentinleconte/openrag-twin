@@ -1,0 +1,548 @@
+import json
+import logging
+import uuid
+from datetime import UTC, datetime, timedelta
+
+import httpx
+from fastapi import HTTPException
+
+from config.settings import (
+    OAUTH_BROKER_URL,
+    WEBHOOK_BASE_URL,
+    is_no_auth_mode,
+    is_workspace_oauth_overrides_enabled,
+)
+from connectors.registry import get_connector_class, get_connector_classes
+from services.langflow_mcp_service import LangflowMCPService
+from session_manager import SessionManager
+
+logger = logging.getLogger(__name__)
+
+
+def _direct_auth_connector_types() -> set:
+    """Bucket-kind connectors authenticate directly (no OAuth redirect)."""
+    return {cls.CONNECTOR_TYPE for cls in get_connector_classes() if cls.CONNECTOR_KIND == "bucket"}
+
+
+def _data_source_connector_types() -> set:
+    """All connector types that can be configured as data sources."""
+    return {cls.CONNECTOR_TYPE for cls in get_connector_classes()}
+
+
+class AuthService:
+    def __init__(
+        self,
+        session_manager: SessionManager,
+        connector_service=None,
+        flows_service=None,
+        langflow_mcp_service: LangflowMCPService | None = None,
+    ):
+        self.session_manager = session_manager
+        self.connector_service = connector_service
+        self.used_auth_codes: set[str] = set()  # Track used authorization codes
+        self.flows_service = flows_service
+        self.langflow_mcp_service = langflow_mcp_service
+
+    async def init_oauth(
+        self,
+        connector_type: str,
+        purpose: str,
+        connection_name: str,
+        redirect_uri: str,
+        user_id: str = None,
+    ) -> dict:
+        """Initialize OAuth flow for authentication or data source connection"""
+        from config.settings import IBM_AUTH_ENABLED
+
+        # IBM auth mode — Google OAuth login is not used
+        if IBM_AUTH_ENABLED and purpose == "app_auth":
+            raise HTTPException(
+                status_code=409,
+                detail="IBM AMS authentication is active. Login is handled via the IBM Watsonx Data session cookie.",
+            )
+
+        # Check if we're in no-auth mode
+        if is_no_auth_mode():
+            if purpose == "app_auth":
+                raise ValueError(
+                    "OAuth credentials not configured. Please add GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET environment variables to enable authentication."
+                )
+            else:
+                raise ValueError(
+                    "OAuth credentials not configured. Data source connections require OAuth setup."
+                )
+
+        # Validate connector_type based on purpose. "test" (admin Test Connection
+        # button, see _handle_test_auth) is validated like "data_source" but does
+        # not persist a connection on success. Gated behind the workspace OAuth
+        # overrides feature flag — off by default.
+        allowed_purposes = (
+            ("app_auth", "data_source", "test")
+            if is_workspace_oauth_overrides_enabled()
+            else ("app_auth", "data_source")
+        )
+        if purpose == "app_auth" and connector_type != "google_drive":
+            raise ValueError("Only Google login supported for app authentication")
+        elif (
+            purpose in ("data_source", "test")
+            and connector_type not in _data_source_connector_types()
+        ):
+            raise ValueError(f"Unsupported connector type: {connector_type}")
+        elif purpose not in allowed_purposes:
+            raise ValueError(f"Unsupported purpose: {purpose}")
+
+        if not redirect_uri:
+            raise ValueError("redirect_uri is required")
+
+        # We'll validate client credentials when creating the connector
+
+        # Create connection configuration - use data directory for persistence
+        from config.paths import get_data_file
+
+        token_file = get_data_file(f"{connector_type}_{purpose}_{uuid.uuid4().hex[:8]}.json")
+        effective_redirect_uri = OAUTH_BROKER_URL or redirect_uri
+        config = {
+            "token_file": token_file,
+            "connector_type": connector_type,
+            "purpose": purpose,
+            "redirect_uri": effective_redirect_uri,
+        }
+
+        # Only add webhook URL if WEBHOOK_BASE_URL is configured
+        if WEBHOOK_BASE_URL:
+            config["webhook_url"] = f"{WEBHOOK_BASE_URL}/connectors/{connector_type}/webhook"
+
+        # Create connection in manager
+        connection_id = await self.connector_service.connection_manager.create_connection(
+            connector_type=connector_type,
+            name=connection_name,
+            config=config,
+            user_id=user_id,
+        )
+
+        # Direct-auth connectors (HMAC/API-key based, no OAuth redirect)
+        if connector_type in _direct_auth_connector_types():
+            return await self._init_direct_connection(connector_type, connection_id)
+
+        # Look up connector + OAuth class pair via the registry.
+        connector_class = get_connector_class(connector_type)
+        oauth_class = (
+            connector_class.get_oauth_class()
+            if connector_class and hasattr(connector_class, "get_oauth_class")
+            else None
+        )
+        if not connector_class or not oauth_class:
+            raise ValueError(f"No classes found for connector type: {connector_type}")
+
+        # Cast to Any to satisfy mypy for class attribute access
+        from typing import Any
+
+        oauth_class_any: Any = oauth_class
+        connector_class_any: Any = connector_class
+
+        # Get scopes from OAuth class
+        scopes = oauth_class_any.SCOPES
+
+        # Get endpoints from OAuth class
+        auth_endpoint = oauth_class_any.AUTH_ENDPOINT
+        token_endpoint = oauth_class_any.TOKEN_ENDPOINT
+
+        # Resolve credentials the same way the connector itself does (per-connection
+        # config override -> workspace-level admin override -> env var), so this
+        # matches what handle_oauth_callback resolves later for the same connector.
+        try:
+            connector_instance = connector_class_any({})
+            client_id = connector_instance.get_client_id()
+            connector_instance.get_client_secret()  # validate it's configured; not returned to the frontend
+        except (ValueError, NotImplementedError, RuntimeError) as e:
+            raise RuntimeError(
+                f"Missing OAuth credentials for {connector_class.__name__}: {e}"
+            ) from e
+
+        # Per-connector OAuth prompt: Microsoft uses "select_account" so a one-time
+        # tenant admin consent is reused; Google uses "consent" for refresh tokens.
+        prompt = getattr(oauth_class_any, "AUTH_PROMPT", "consent")
+
+        return {
+            "connection_id": connection_id,
+            "oauth_config": {
+                "client_id": client_id,
+                "scopes": scopes,
+                "redirect_uri": effective_redirect_uri,
+                "authorization_endpoint": auth_endpoint,
+                "token_endpoint": token_endpoint,
+                "prompt": prompt,
+            },
+        }
+
+    async def _init_direct_connection(self, connector_type: str, connection_id: str) -> dict:
+        """Authenticate a non-OAuth connector immediately using env var credentials.
+
+        Creates the connection record (already done by the caller) and verifies
+        that the credentials work by calling authenticate() on the connector.
+        Returns a response without oauth_config so the frontend knows no redirect
+        is needed.
+        """
+        try:
+            connection_config = await self.connector_service.connection_manager.get_connection(
+                connection_id
+            )
+            if not connection_config:
+                raise ValueError("Connection not found")
+
+            connector = self.connector_service.connection_manager._create_connector(
+                connection_config
+            )
+            authenticated = await connector.authenticate()
+            if not authenticated:
+                # Remove the connection so the user can retry after fixing credentials
+                await self.connector_service.connection_manager.delete_connection(connection_id)
+                raise ValueError(
+                    f"Could not authenticate with {connector_type}. "
+                    "Check that your credentials and endpoint are correct."
+                )
+
+            # Cache the authenticated connector
+            self.connector_service.connection_manager.active_connectors[connection_id] = connector
+
+        except ValueError:
+            raise
+        except Exception as exc:
+            await self.connector_service.connection_manager.delete_connection(connection_id)
+            raise ValueError(f"Failed to connect {connector_type}: {exc}") from exc
+
+        return {
+            "connection_id": connection_id,
+            "status": "connected",
+            "connector_type": connector_type,
+            # No oauth_config — frontend must not attempt an OAuth redirect
+        }
+
+    async def handle_oauth_callback(
+        self,
+        connection_id: str,
+        authorization_code: str,
+        state: str = None,
+        request=None,
+    ) -> dict:
+        """Handle OAuth callback - exchange authorization code for tokens"""
+        logger.info(f"OAuth callback state: {state}")
+        if not all([connection_id, authorization_code]):
+            raise ValueError("Missing required parameters (connection_id, authorization_code)")
+
+        # Check if authorization code has already been used
+        if authorization_code in self.used_auth_codes:
+            raise ValueError("Authorization code already used")
+
+        # Mark code as used to prevent duplicate requests
+        self.used_auth_codes.add(authorization_code)
+
+        try:
+            # Get connection config
+            connection_config = await self.connector_service.connection_manager.get_connection(
+                connection_id
+            )
+            if not connection_config:
+                raise ValueError("Connection not found")
+
+            # Exchange authorization code for tokens
+            redirect_uri = connection_config.config.get("redirect_uri")
+            if not redirect_uri:
+                raise ValueError("Redirect URI not found in connection config")
+
+            # Get connector to access client credentials and endpoints
+            connector = self.connector_service.connection_manager._create_connector(
+                connection_config
+            )
+
+            # Get token endpoint from connector type
+            connector_type = connection_config.connector_type
+            connector_class = get_connector_class(connector_type)
+            oauth_class = (
+                connector_class.get_oauth_class()
+                if connector_class and hasattr(connector_class, "get_oauth_class")
+                else None
+            )
+            if not connector_class or not oauth_class:
+                raise ValueError(f"No classes found for connector type: {connector_type}")
+
+            from typing import Any
+
+            oauth_class_any: Any = oauth_class
+            token_url = oauth_class_any.TOKEN_ENDPOINT
+
+            token_payload = {
+                "code": authorization_code,
+                "client_id": connector.get_client_id(),
+                "client_secret": connector.get_client_secret(),
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            }
+
+            async with httpx.AsyncClient() as client:
+                token_response = await client.post(token_url, data=token_payload)
+
+            if token_response.status_code != 200:
+                raise Exception(f"Token exchange failed: {token_response.text}")
+
+            token_data = token_response.json()
+
+            # Verify Google ID token immediately after code exchange, before persisting credentials.
+            # Raises JWTVerificationError on any validation failure — connection is rejected.
+            if connector_type == "google_drive":
+                from connectors.google_drive.oauth import _verify_id_token
+
+                _verify_id_token(token_data.get("id_token"))
+                logger.debug("[AUTH] Google ID token verification completed for OAuth callback")
+
+            # Store tokens in the token file (without client_secret)
+            # Use actual scopes from OAuth response
+            granted_scopes = token_data.get("scope")
+            if not granted_scopes:
+                raise ValueError(
+                    f"OAuth provider for {connector_type} did not return granted scopes in token response"
+                )
+
+            # OAuth providers typically return scopes as a space-separated string
+            scopes = (
+                granted_scopes.split(" ") if isinstance(granted_scopes, str) else granted_scopes
+            )
+
+            token_file_data = {
+                "token": token_data["access_token"],
+                "refresh_token": token_data.get("refresh_token"),
+                "id_token": token_data.get("id_token"),
+                "scopes": scopes,
+            }
+
+            # Add expiry if provided
+            if token_data.get("expires_in"):
+                expiry = datetime.now(UTC) + timedelta(seconds=int(token_data["expires_in"]))
+                token_file_data["expiry"] = expiry.isoformat()
+
+            # Save tokens to file
+            token_file_path = connection_config.config["token_file"]
+            from utils.encryption import write_encrypted_file
+
+            await write_encrypted_file(token_file_path, json.dumps(token_file_data))
+
+            # Route based on purpose
+            purpose = connection_config.config.get("purpose", "data_source")
+
+            if purpose == "app_auth":
+                return await self._handle_app_auth(
+                    connection_id, connection_config, token_data, request
+                )
+            elif purpose == "test":
+                return await self._handle_test_auth(connection_id, connection_config)
+            else:
+                return await self._handle_data_source_auth(connection_id, connection_config)
+
+        except Exception as e:
+            # Remove used code from set if we failed
+            self.used_auth_codes.discard(authorization_code)
+            raise e
+
+    async def _handle_test_auth(self, connection_id: str, connection_config) -> dict:
+        """Handle a Test Connection run — the token exchange already succeeded by
+        the time this is called, which proves the active client id/secret work.
+        Unlike a real data-source connection, a test must not persist anything:
+        no base-URL detection, no webhook subscription, and the temporary
+        connection + token file are deleted immediately.
+        """
+        connector_type = connection_config.connector_type
+        await self.connector_service.connection_manager.delete_connection(connection_id)
+        return {
+            "status": "test_success",
+            "connector_type": connector_type,
+            "purpose": "test",
+        }
+
+    async def _handle_app_auth(
+        self, connection_id: str, connection_config, token_data: dict, request=None
+    ) -> dict:
+        """Handle app authentication - create user session"""
+        # Extract issuer from redirect_uri in connection config
+        redirect_uri = connection_config.config.get("redirect_uri")
+        if not redirect_uri:
+            raise ValueError("redirect_uri not found in connection config")
+        # Get base URL from redirect_uri (remove path)
+        from urllib.parse import urlparse
+
+        parsed = urlparse(redirect_uri)
+        issuer = f"{parsed.scheme}://{parsed.netloc}"
+
+        jwt_token = await self.session_manager.create_user_session(
+            token_data["access_token"], issuer
+        )
+
+        if jwt_token:
+            # Get the user info to create a persistent connector connection
+            user_info = await self.session_manager.get_user_info_from_token(
+                token_data["access_token"]
+            )
+
+            response_data = {
+                "status": "authenticated",
+                "purpose": "app_auth",
+                "redirect": "/",
+                "jwt_token": jwt_token,  # Include JWT token in response
+            }
+
+            if user_info and user_info.get("id"):
+                # Convert the temporary auth connection to a persistent OAuth connection
+                await self.connector_service.connection_manager.update_connection(
+                    connection_id=connection_id,
+                    connector_type="google_drive",
+                    name=f"Google Drive ({user_info.get('email', 'Unknown')})",
+                    user_id=user_info.get("id"),
+                    config={
+                        **connection_config.config,
+                        "purpose": "data_source",
+                        "user_email": user_info.get("email"),
+                        **(
+                            {"webhook_url": f"{WEBHOOK_BASE_URL}/connectors/google_drive/webhook"}
+                            if WEBHOOK_BASE_URL
+                            else {}
+                        ),
+                    },
+                )
+                response_data["google_drive_connection_id"] = connection_id
+            else:
+                # Fallback: delete connection if we can't get user info
+                await self.connector_service.connection_manager.delete_connection(connection_id)
+
+            return response_data
+        else:
+            # Clean up connection if session creation failed
+            await self.connector_service.connection_manager.delete_connection(connection_id)
+            raise Exception("Failed to create user session")
+
+    async def _handle_data_source_auth(self, connection_id: str, connection_config) -> dict:
+        """Handle data source connection - keep the connection for syncing"""
+        result = {
+            "status": "authenticated",
+            "connection_id": connection_id,
+            "purpose": "data_source",
+            "connector_type": connection_config.connector_type,
+        }
+
+        # For SharePoint/OneDrive, auto-detect the base URL after authentication
+        if connection_config.connector_type in ("sharepoint", "onedrive"):
+            logger.info(
+                f"_handle_data_source_auth: Starting base URL detection for {connection_config.connector_type}"
+            )
+            try:
+                # Get the connector to detect base URL
+                logger.info(
+                    f"_handle_data_source_auth: Getting connector for connection_id: {connection_id}"
+                )
+                connector = await self.connector_service.connection_manager.get_connector(
+                    connection_id
+                )
+                logger.info(
+                    f"_handle_data_source_auth: Got connector: {connector is not None}, has _detect_base_url: {hasattr(connector, '_detect_base_url') if connector else False}"
+                )
+
+                if connector and hasattr(connector, "_detect_base_url"):
+                    logger.info("_handle_data_source_auth: Calling _detect_base_url()")
+                    detected_url = await connector._detect_base_url()
+                    logger.info(
+                        f"_handle_data_source_auth: _detect_base_url returned: {detected_url}"
+                    )
+
+                    if detected_url:
+                        # Update connection config with detected URL (generic field name)
+                        connection_config.config["base_url"] = detected_url
+                        # Also update the connector instance's base_url property
+                        connector.base_url = detected_url
+                        logger.info(
+                            f"_handle_data_source_auth: Updated connector.base_url to: {connector.base_url}"
+                        )
+                        await self.connector_service.connection_manager.save_connections()
+                        result["base_url"] = detected_url
+                        logger.info(
+                            f"_handle_data_source_auth: Auto-detected and saved base URL: {detected_url}"
+                        )
+                    else:
+                        logger.warning("_handle_data_source_auth: _detect_base_url returned None")
+                else:
+                    logger.warning(
+                        "_handle_data_source_auth: Connector not available or doesn't have _detect_base_url"
+                    )
+
+                # Clear the cached connector so next get_connector() creates a fresh instance
+                # with the updated config (including base_url)
+                if connection_id in self.connector_service.connection_manager.active_connectors:
+                    logger.info(
+                        f"_handle_data_source_auth: Clearing cached connector for {connection_id}"
+                    )
+                    del self.connector_service.connection_manager.active_connectors[connection_id]
+            except Exception:
+                logger.exception("[AUTH] Auto-detect base URL failed")
+
+        # Register the change-notification subscription now that the connection is
+        # authenticated. Data-source connections don't go through update_connection
+        # (which handles this for the app-auth flow), so without this no webhook
+        # subscription is ever created for them.
+        try:
+            connection_manager = self.connector_service.connection_manager
+            connector = await connection_manager.get_connector(connection_id)
+            if connector:
+                await connection_manager._setup_webhook_if_needed(
+                    connection_id, connection_config, connector
+                )
+        except Exception:
+            logger.exception("[AUTH] Webhook subscription setup failed")
+
+        return result
+
+    async def get_user_info(self, request) -> dict | None:
+        """Get current user information from request"""
+        from config.settings import IBM_AUTH_ENABLED
+
+        # IBM auth mode: user is set by get_optional_user from IBM cookie
+        if IBM_AUTH_ENABLED:
+            user = getattr(request.state, "user", None)
+            if user and user.provider in ("ibm_ams", "ibm_ams_basic"):
+                return {
+                    "authenticated": True,
+                    "ibm_auth_mode": True,
+                    "user": {
+                        "user_id": user.user_id,
+                        "email": user.email,
+                        "name": user.name,
+                        "picture": user.picture,
+                        "provider": user.provider,
+                        "last_login": user.last_login.isoformat() if user.last_login else None,
+                    },
+                }
+            return {"authenticated": False, "ibm_auth_mode": True, "user": None}
+
+        # In no-auth mode, return a consistent response
+        if is_no_auth_mode():
+            return {"authenticated": False, "user": None, "no_auth_mode": True}
+
+        user = getattr(request.state, "user", None)
+
+        if user:
+            user_data = {
+                "authenticated": True,
+                "ibm_auth_mode": IBM_AUTH_ENABLED,
+                "user": {
+                    "user_id": user.user_id,
+                    "email": user.email,
+                    "name": user.name,
+                    "picture": user.picture,
+                    "provider": user.provider,
+                    "last_login": user.last_login.isoformat() if user.last_login else None,
+                },
+            }
+
+            return user_data
+        else:
+            return {
+                "authenticated": False,
+                "ibm_auth_mode": IBM_AUTH_ENABLED,
+                "user": None,
+            }

@@ -1,0 +1,362 @@
+"use client";
+
+import { SharePointV8Handler } from "./sharepoint-v8-handler";
+import {
+  CloudFile,
+  CloudProvider,
+  GooglePickerData,
+  GooglePickerDocument,
+} from "./types";
+
+class GoogleDriveHandler {
+  private accessToken: string;
+  private onPickerStateChange?: (isOpen: boolean) => void;
+
+  constructor(
+    accessToken: string,
+    onPickerStateChange?: (isOpen: boolean) => void,
+  ) {
+    this.accessToken = accessToken;
+    this.onPickerStateChange = onPickerStateChange;
+  }
+
+  async loadPickerApi(): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (typeof window !== "undefined" && window.gapi) {
+        window.gapi.load("picker", {
+          callback: () => resolve(true),
+          onerror: () => resolve(false),
+        });
+      } else {
+        // Load Google API script
+        const script = document.createElement("script");
+        script.src = "https://apis.google.com/js/api.js";
+        script.async = true;
+        script.defer = true;
+        script.onload = () => {
+          window.gapi.load("picker", {
+            callback: () => resolve(true),
+            onerror: () => resolve(false),
+          });
+        };
+        script.onerror = () => resolve(false);
+        document.head.appendChild(script);
+      }
+    });
+  }
+
+  openPicker(onFileSelected: (files: CloudFile[]) => void): void {
+    if (!window.google?.picker) {
+      return;
+    }
+
+    try {
+      this.onPickerStateChange?.(true);
+
+      // Create a view for regular documents
+      const docsView = new window.google.picker.DocsView()
+        .setIncludeFolders(true)
+        .setSelectFolderEnabled(true);
+
+      const picker = new window.google.picker.PickerBuilder()
+        .addView(docsView)
+        .setOAuthToken(this.accessToken)
+        .enableFeature(window.google.picker.Feature.MULTISELECT_ENABLED)
+        .setTitle("Select files or folders from Google Drive")
+        .setCallback((data) => this.pickerCallback(data, onFileSelected))
+        .build();
+
+      picker.setVisible(true);
+
+      // Apply z-index fix
+      setTimeout(() => {
+        const pickerElements = document.querySelectorAll(
+          ".picker-dialog, .goog-modalpopup",
+        );
+        pickerElements.forEach((el) => {
+          (el as HTMLElement).style.zIndex = "10000";
+        });
+        const bgElements = document.querySelectorAll(
+          ".picker-dialog-bg, .goog-modalpopup-bg",
+        );
+        bgElements.forEach((el) => {
+          (el as HTMLElement).style.zIndex = "9999";
+        });
+      }, 100);
+    } catch (error) {
+      console.error("Error creating picker:", error);
+      this.onPickerStateChange?.(false);
+    }
+  }
+
+  private async pickerCallback(
+    data: GooglePickerData,
+    onFileSelected: (files: CloudFile[]) => void,
+  ): Promise<void> {
+    if (data.action === window.google.picker.Action.PICKED) {
+      const files: CloudFile[] = data.docs.map((doc: GooglePickerDocument) => ({
+        id: doc[window.google.picker.Document.ID],
+        name: doc[window.google.picker.Document.NAME],
+        mimeType: doc[window.google.picker.Document.MIME_TYPE],
+        webViewLink: doc[window.google.picker.Document.URL],
+        iconLink: doc[window.google.picker.Document.ICON_URL],
+        size: doc["sizeBytes"] ? parseInt(doc["sizeBytes"]) : undefined,
+        modifiedTime: doc["lastEditedUtc"],
+        isFolder:
+          doc[window.google.picker.Document.MIME_TYPE] ===
+          "application/vnd.google-apps.folder",
+      }));
+
+      // Enrich with additional file data if needed
+      if (files.some((f) => !f.size && !f.isFolder)) {
+        try {
+          const enrichedFiles = await Promise.all(
+            files.map(async (file) => {
+              if (!file.size && !file.isFolder) {
+                try {
+                  const response = await fetch(
+                    `https://www.googleapis.com/drive/v3/files/${file.id}?fields=size,modifiedTime`,
+                    {
+                      headers: {
+                        Authorization: `Bearer ${this.accessToken}`,
+                      },
+                    },
+                  );
+                  if (response.ok) {
+                    const fileDetails = await response.json();
+                    return {
+                      ...file,
+                      size: fileDetails.size
+                        ? parseInt(fileDetails.size)
+                        : undefined,
+                      modifiedTime:
+                        fileDetails.modifiedTime || file.modifiedTime,
+                    };
+                  }
+                } catch (error) {
+                  console.warn("Failed to fetch file details:", error);
+                }
+              }
+              return file;
+            }),
+          );
+          onFileSelected(enrichedFiles);
+        } catch (error) {
+          console.warn("Failed to enrich file data:", error);
+          onFileSelected(files);
+        }
+      } else {
+        onFileSelected(files);
+      }
+    }
+
+    this.onPickerStateChange?.(false);
+  }
+}
+
+class OneDriveHandler {
+  private accessToken: string;
+  private clientId: string;
+  private provider: CloudProvider;
+  private baseUrl?: string;
+  private onPickerStateChange?: (isOpen: boolean) => void;
+
+  constructor(
+    accessToken: string,
+    clientId: string,
+    provider: CloudProvider = "onedrive",
+    baseUrl?: string,
+    onPickerStateChange?: (isOpen: boolean) => void,
+  ) {
+    this.accessToken = accessToken;
+    this.clientId = clientId;
+    this.provider = provider;
+    this.baseUrl = baseUrl;
+    this.onPickerStateChange = onPickerStateChange;
+  }
+
+  async loadPickerApi(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const script = document.createElement("script");
+      script.src = "https://js.live.net/v7.2/OneDrive.js";
+      script.onload = () => resolve(true);
+      script.onerror = () => resolve(false);
+      document.head.appendChild(script);
+    });
+  }
+
+  openPicker(onFileSelected: (files: CloudFile[]) => void): void {
+    if (!window.OneDrive) {
+      return;
+    }
+
+    // For SharePoint, use the SharePoint site URL as endpoint hint
+    // For OneDrive, use the default OneDrive API endpoint
+    const endpointHint =
+      this.provider === "sharepoint" && this.baseUrl
+        ? this.baseUrl
+        : "api.onedrive.com";
+
+    window.OneDrive.open({
+      clientId: this.clientId,
+      action: "query",
+      multiSelect: true,
+      viewType: "all",
+      advanced: {
+        endpointHint: endpointHint,
+        accessToken: this.accessToken,
+      },
+      success: (response: any) => {
+        if (!response || !response.value) {
+          console.warn("OneDrive picker returned no value");
+          this.onPickerStateChange?.(false);
+          return;
+        }
+
+        // v7.2 action:"query" returns stubs with only id/endpoint/parentReference.
+        // Enrich each item by fetching full metadata from the Graph API.
+        const enrichItems = async () => {
+          const enriched = await Promise.all(
+            response.value.map(async (item: any) => {
+              const driveId =
+                item.parentReference?.driveId || item.id?.split("!")[0];
+              const itemId = item.id;
+
+              if (driveId && itemId) {
+                try {
+                  const url = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}`;
+                  const res = await fetch(url, {
+                    headers: { Authorization: `Bearer ${this.accessToken}` },
+                  });
+                  if (res.ok) {
+                    const meta = await res.json();
+
+                    let mimeType = meta.file?.mimeType;
+                    if (!mimeType && meta.name) {
+                      const ext = meta.name.split(".").pop()?.toLowerCase();
+                      const mimeTypes: { [key: string]: string } = {
+                        pdf: "application/pdf",
+                        doc: "application/msword",
+                        docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        xls: "application/vnd.ms-excel",
+                        xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        ppt: "application/vnd.ms-powerpoint",
+                        pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        txt: "text/plain",
+                        csv: "text/csv",
+                        json: "application/json",
+                        xml: "application/xml",
+                        html: "text/html",
+                        jpg: "image/jpeg",
+                        jpeg: "image/jpeg",
+                        png: "image/png",
+                        gif: "image/gif",
+                        svg: "image/svg+xml",
+                      };
+                      mimeType =
+                        mimeTypes[ext || ""] || "application/octet-stream";
+                    }
+
+                    return {
+                      id: meta.id,
+                      name: meta.name || `${this.getProviderName()} File`,
+                      mimeType: mimeType || "application/octet-stream",
+                      webUrl: meta.webUrl || "",
+                      downloadUrl: meta["@microsoft.graph.downloadUrl"] || "",
+                      size: meta.size,
+                      modifiedTime: meta.lastModifiedDateTime,
+                      isFolder: !!meta.folder,
+                    } as CloudFile;
+                  } else {
+                    console.warn(
+                      "Graph API metadata fetch failed:",
+                      res.status,
+                      await res.text(),
+                    );
+                  }
+                } catch (e) {
+                  console.warn("Graph API metadata fetch error:", e);
+                }
+              }
+
+              // Fallback: use stub data if Graph call fails
+              return {
+                id: item.id,
+                name: item.name || `${this.getProviderName()} File`,
+                mimeType: "application/octet-stream",
+                webUrl: item.webUrl || "",
+                downloadUrl: item["@microsoft.graph.downloadUrl"] || "",
+                size: item.size,
+                modifiedTime: item.lastModifiedDateTime,
+                isFolder: !!item.folder,
+              } as CloudFile;
+            }),
+          );
+
+          onFileSelected(enriched);
+          this.onPickerStateChange?.(false);
+        };
+
+        enrichItems().catch((e) => {
+          console.error("Failed to enrich OneDrive items:", e);
+          this.onPickerStateChange?.(false);
+        });
+      },
+      cancel: () => {
+        this.onPickerStateChange?.(false);
+      },
+      error: (error: any) => {
+        console.error("Picker error callback:", error);
+        this.onPickerStateChange?.(false);
+      },
+    });
+  }
+
+  private getProviderName(): string {
+    return this.provider === "sharepoint" ? "SharePoint" : "OneDrive";
+  }
+}
+
+export const createProviderHandler = (
+  provider: CloudProvider,
+  accessToken: string,
+  onPickerStateChange?: (isOpen: boolean) => void,
+  clientId?: string,
+  baseUrl?: string,
+) => {
+  switch (provider) {
+    case "google_drive":
+      return new GoogleDriveHandler(accessToken, onPickerStateChange);
+    case "sharepoint":
+      // Use v8 File Picker for SharePoint - v7.2 has "Knockout deprecated" bug
+      // making Select/Cancel buttons unresponsive
+      if (!clientId) {
+        throw new Error("Client ID required for SharePoint");
+      }
+      if (!baseUrl) {
+        throw new Error("Base URL required for SharePoint v8 picker");
+      }
+      return new SharePointV8Handler(
+        baseUrl,
+        accessToken,
+        clientId,
+        onPickerStateChange,
+      );
+
+    case "onedrive":
+      // Use v7.2 (OneDrive.js) for personal OneDrive - v8 doesn't work for consumer accounts
+      // Backend uses /shares API to handle the sharing IDs that v7.2 returns
+      if (!clientId) {
+        throw new Error("Client ID required for OneDrive");
+      }
+      return new OneDriveHandler(
+        accessToken,
+        clientId,
+        provider,
+        baseUrl,
+        onPickerStateChange,
+      );
+    default:
+      throw new Error(`Unsupported provider: ${provider}`);
+  }
+};

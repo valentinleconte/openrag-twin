@@ -1,0 +1,206 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { useGetSettingsQuery } from "@/app/api/queries/useGetSettingsQuery";
+import { useAuth } from "@/contexts/auth-context";
+import { FileList } from "./file-list";
+import { IngestSettings } from "./ingest-settings";
+import { PickerHeader } from "./picker-header";
+import { createProviderHandler } from "./provider-handlers";
+import {
+  CloudFile,
+  IngestSettings as IngestSettingsType,
+  UnifiedCloudPickerProps,
+} from "./types";
+
+const EMPTY_FILES: CloudFile[] = [];
+
+export const UnifiedCloudPicker = ({
+  provider,
+  onFileSelected,
+  selectedFiles = EMPTY_FILES,
+  isAuthenticated,
+  isIngesting,
+  accessToken,
+  onPickerStateChange,
+  clientId,
+  baseUrl,
+  ingestSettings: ingestSettingsProp,
+  onIngestSettingsChange,
+  onSettingsChange,
+}: UnifiedCloudPickerProps) => {
+  const { isNoAuthMode } = useAuth();
+  const { data: apiSettings } = useGetSettingsQuery({
+    enabled: isAuthenticated || isNoAuthMode,
+  });
+  const showIngestSettings =
+    apiSettings?.show_provider_ingest_settings ?? false;
+
+  const [isPickerLoaded, setIsPickerLoaded] = useState(false);
+  const [isPickerOpen, setIsPickerOpen] = useState(false);
+  const [isIngestSettingsOpen, setIsIngestSettingsOpen] = useState(false);
+  const [autoBaseUrl, setAutoBaseUrl] = useState<string | undefined>(undefined);
+
+  const isControlled =
+    ingestSettingsProp !== undefined && onIngestSettingsChange !== undefined;
+
+  const [localIngestSettings, setLocalIngestSettings] =
+    useState<IngestSettingsType>({
+      chunkSize: 1000,
+      chunkOverlap: 200,
+      ocr: false,
+      pictureDescriptions: false,
+      embeddingModel: "text-embedding-3-small",
+    });
+
+  const ingestSettings = isControlled
+    ? ingestSettingsProp!
+    : localIngestSettings;
+
+  const handleIngestSettingsChange = (newSettings: IngestSettingsType) => {
+    if (isControlled) {
+      onIngestSettingsChange!(newSettings);
+    } else {
+      setLocalIngestSettings(newSettings);
+    }
+    onSettingsChange?.(newSettings);
+  };
+
+  const effectiveBaseUrl = baseUrl || autoBaseUrl;
+
+  if (provider === "onedrive" && !baseUrl && accessToken && !autoBaseUrl) {
+    setAutoBaseUrl("https://onedrive.live.com/picker");
+  }
+
+  // Load picker API
+  useEffect(() => {
+    if (!accessToken || !isAuthenticated) return;
+
+    const loadApi = async () => {
+      try {
+        const handler = createProviderHandler(
+          provider,
+          accessToken,
+          onPickerStateChange,
+          clientId,
+          effectiveBaseUrl,
+        );
+        const loaded = await handler.loadPickerApi();
+        setIsPickerLoaded(loaded);
+      } catch (error) {
+        console.error("Failed to create provider handler:", error);
+        setIsPickerLoaded(false);
+      }
+    };
+
+    loadApi();
+  }, [
+    accessToken,
+    isAuthenticated,
+    provider,
+    clientId,
+    effectiveBaseUrl,
+    onPickerStateChange,
+  ]);
+
+  const handleAddFiles = () => {
+    if (!isPickerLoaded || !accessToken) {
+      return;
+    }
+
+    if ((provider === "onedrive" || provider === "sharepoint") && !clientId) {
+      return;
+    }
+
+    try {
+      setIsPickerOpen(true);
+      onPickerStateChange?.(true);
+
+      const handler = createProviderHandler(
+        provider,
+        accessToken,
+        (isOpen) => {
+          setIsPickerOpen(isOpen);
+          onPickerStateChange?.(isOpen);
+        },
+        clientId,
+        effectiveBaseUrl,
+      );
+
+      handler.openPicker((files: CloudFile[]) => {
+        // Merge new files with existing ones, avoiding duplicates
+        const existingIds = new Set(selectedFiles.map((f) => f.id));
+        const newFiles = files.filter((f) => !existingIds.has(f.id));
+        onFileSelected([...selectedFiles, ...newFiles]);
+      });
+    } catch (error) {
+      console.error("Error opening picker:", error);
+      setIsPickerOpen(false);
+      onPickerStateChange?.(false);
+    }
+  };
+
+  const handleRemoveFile = (fileId: string) => {
+    const updatedFiles = selectedFiles.filter((file) => file.id !== fileId);
+    onFileSelected(updatedFiles);
+  };
+
+  const handleClearAll = () => {
+    onFileSelected([]);
+  };
+
+  if (
+    (provider === "onedrive" || provider === "sharepoint") &&
+    !clientId &&
+    isAuthenticated
+  ) {
+    return (
+      <div className="text-sm text-muted-foreground p-4 bg-muted/20 rounded-md">
+        Configuration required: Client ID missing for{" "}
+        {provider === "sharepoint" ? "SharePoint" : "OneDrive"}.
+      </div>
+    );
+  }
+
+  if (provider === "sharepoint" && !baseUrl && isAuthenticated) {
+    return (
+      <div className="text-sm text-muted-foreground p-4 bg-muted/20 rounded-md">
+        Configuration required: A site URL has not been configured for this
+        connector. Please update your connector settings with a valid site URL
+        for your organization and try again.
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div className="mb-6">
+        <PickerHeader
+          provider={provider}
+          onAddFiles={handleAddFiles}
+          isPickerLoaded={isPickerLoaded}
+          isPickerOpen={isPickerOpen}
+          accessToken={accessToken}
+          isAuthenticated={isAuthenticated}
+        />
+      </div>
+
+      <FileList
+        provider={provider}
+        files={selectedFiles}
+        onClearAll={handleClearAll}
+        onRemoveFile={handleRemoveFile}
+        shouldDisableActions={isIngesting}
+      />
+
+      {showIngestSettings && (
+        <IngestSettings
+          isOpen={isIngestSettingsOpen}
+          onOpenChange={setIsIngestSettingsOpen}
+          settings={ingestSettings}
+          onSettingsChange={handleIngestSettingsChange}
+        />
+      )}
+    </div>
+  );
+};

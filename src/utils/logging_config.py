@@ -1,0 +1,388 @@
+import logging
+import logging.config
+import os
+import re
+import sys
+from typing import Any
+
+import structlog
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+LOC_WIDTH_SHORT = 30
+LOC_WIDTH_LONG = 60
+
+LEVEL_COLORS = {
+    "DEBUG": "\033[36m",  # Cyan
+    "INFO": "\033[32m",  # Green
+    "WARNING": "\033[33m",  # Yellow
+    "ERROR": "\033[31m",  # Red
+    "CRITICAL": "\033[1;31m",  # Bold red
+}
+DIM = "\033[38;5;244m"  # Medium grey
+RESET = "\033[0m"
+
+_SENSITIVE_HEADER_RE = re.compile(
+    r"(key|token|secret|password|apikey|credential|jwt|auth)", re.IGNORECASE
+)
+
+# Shared processors stored at module level so configure_stdlib_logging() can
+# reference the same chain that configure_logging() assembled.
+_shared_processors: list = []
+
+# Minimum stdlib level integer that gets mirrored into the component buffer.
+# WARNING=30, ERROR=40, CRITICAL=50.
+_MIRROR_MIN_LEVEL = logging.WARNING
+
+
+# ---------------------------------------------------------------------------
+# Standalone processors (module-level so they can be reused in stdlib bridge)
+# ---------------------------------------------------------------------------
+
+
+def drop_color_message_key(_, __, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Remove uvicorn's duplicate color_message field when bridging via stdlib."""
+    event_dict.pop("color_message", None)
+    return event_dict
+
+
+def filter_health_and_metrics(_, __, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Drop log events for high-frequency health/metrics endpoints."""
+    path = event_dict.get("path", "")
+    if path in ("/health", "/metrics", "/healthz", "/docs", "/openapi.json"):
+        raise structlog.DropEvent()
+    return event_dict
+
+
+def suppress_third_party_noise(_, __, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Drop WARNING/INFO/DEBUG log lines that originate from installed packages.
+
+    Third-party libraries (opensearch-py, httpx, boto3 …) log every HTTP
+    request at WARNING level during normal operation.  These are pure noise in
+    production — only ERROR and above from library code is actionable.
+    """
+    pathname = event_dict.get("pathname", "")
+    level = event_dict.get("level", "info")
+    if (".venv" in pathname or "site-packages" in pathname) and level not in ("error", "critical"):
+        raise structlog.DropEvent()
+    return event_dict
+
+
+def clean_log_location(_, __, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Shorten pathname to a package-relative form for readability.
+
+    Strips the leading venv/site-packages prefix so logs show
+    ``opensearchpy/connection/base.py`` instead of the full absolute path.
+    """
+    pathname = event_dict.get("pathname", "")
+    marker = "site-packages/"
+    idx = pathname.find(marker)
+    if idx != -1:
+        event_dict["pathname"] = pathname[idx + len(marker) :]
+    return event_dict
+
+
+def add_global_fields_factory(service: str, env: str, version: str):
+    """Return a processor that stamps every event with service metadata."""
+
+    def processor(_, __, event_dict: dict[str, Any]) -> dict[str, Any]:
+        event_dict.setdefault("service", service)
+        event_dict.setdefault("env", env)
+        event_dict.setdefault("version", version)
+        return event_dict
+
+    return processor
+
+
+def mirror_to_component_buffer(_, __, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Structlog processor: mirror WARNING+ backend events into the 'openrag' buffer.
+
+    Runs after add_log_level so event_dict["level"] is always present.
+    Uses lazy import to avoid circular imports at module load time.
+    Reuses _SENSITIVE_HEADER_RE for key redaction; also strips Bearer tokens.
+    This processor is a pass-through — it never drops or modifies the event.
+    """
+    try:
+        level_str = event_dict.get("level", "info")
+        level_int = getattr(logging, level_str.upper(), logging.INFO)
+        if level_int < _MIRROR_MIN_LEVEL:
+            return event_dict
+
+        from services.component_logs import _redact_dict, record  # noqa: PLC0415
+
+        safe = _redact_dict(dict(event_dict))
+        message = str(safe.pop("event", ""))
+        # Build a compact detail string from remaining context keys (skip
+        # structlog internals and the fields already in message/level).
+        skip = {
+            "level",
+            "service",
+            "env",
+            "version",
+            "timestamp",
+            "func_name",
+            "filename",
+            "lineno",
+            "pathname",
+        }
+        detail_parts = [f"{k}={v}" for k, v in safe.items() if k not in skip and v is not None]
+        detail = "; ".join(detail_parts) if detail_parts else None
+
+        record("openrag", level_str.lower(), message, detail=detail)
+    except Exception:  # pragma: no cover — never let logging crash the app
+        pass
+    return event_dict
+
+
+# ---------------------------------------------------------------------------
+# Security helper
+# ---------------------------------------------------------------------------
+
+
+def sanitize_headers(headers: dict) -> dict:
+    """Return a copy of *headers* with values of sensitive keys masked."""
+    return {k: "***" if _SENSITIVE_HEADER_RE.search(k) else v for k, v in headers.items()}
+
+
+# ---------------------------------------------------------------------------
+# Main configuration
+# ---------------------------------------------------------------------------
+
+
+def configure_logging(
+    log_level: str = "INFO",
+    json_logs: bool = False,
+    include_timestamps: bool = True,
+    service_name: str = "openrag",
+    app_env: str = "production",
+    app_version: str = "unknown",
+) -> None:
+    """Configure structlog for the application."""
+    global _shared_processors
+
+    level = getattr(logging, log_level.upper(), logging.INFO)
+
+    use_json = json_logs or os.getenv("LOG_FORMAT", "").lower() == "json"
+
+    # Base processors — always run first
+    base_processors = [
+        structlog.contextvars.merge_contextvars,
+        filter_health_and_metrics,
+        suppress_third_party_noise,
+        clean_log_location,
+        add_global_fields_factory(service_name, app_env, app_version),
+        structlog.processors.add_log_level,
+        # Mirror WARNING+ to the per-component ring buffer (must come after
+        # add_log_level so event_dict["level"] is populated).
+        mirror_to_component_buffer,
+        structlog.processors.StackInfoRenderer(),
+        drop_color_message_key,
+    ]
+
+    if include_timestamps:
+        base_processors.append(structlog.processors.TimeStamper(fmt="iso", utc=True))
+
+    base_processors.append(
+        structlog.processors.CallsiteParameterAdder(
+            parameters=[
+                structlog.processors.CallsiteParameter.FUNC_NAME,
+                structlog.processors.CallsiteParameter.FILENAME,
+                structlog.processors.CallsiteParameter.LINENO,
+                structlog.processors.CallsiteParameter.PATHNAME,
+            ]
+        )
+    )
+
+    _shared_processors = list(base_processors)
+
+    if use_json:
+        # Production: structured tracebacks (queryable in ELK/Datadog/Splunk).
+        # show_locals=False: local variables routinely hold API keys, JWTs, and
+        # other request headers (see extra_headers/request_params in agent.py) —
+        # they must never be serialized into logs. dict_tracebacks defaults to
+        # show_locals=True, which leaked exactly that into production logs.
+        render_processors = [
+            structlog.processors.ExceptionRenderer(
+                structlog.tracebacks.ExceptionDictTransformer(show_locals=False)
+            ),
+            structlog.processors.JSONRenderer(),
+        ]
+    else:
+        # Development: human-readable with exception info as text
+        use_colors = (
+            "NO_COLOR" not in os.environ and hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
+        )
+
+        def custom_formatter(logger, log_method, event_dict):
+            timestamp = event_dict.pop("timestamp", "")
+            pathname = event_dict.pop("pathname", "")
+            filename = event_dict.pop("filename", "")
+            lineno = event_dict.pop("lineno", "")
+            lvl = event_dict.pop("level", "").upper()
+
+            if filename and lineno:
+                location = f"{filename}:{lineno}"
+                loc_width = LOC_WIDTH_SHORT
+            elif pathname and lineno:
+                location = f"{pathname}:{lineno}"
+                loc_width = LOC_WIDTH_LONG
+            elif filename:
+                location = filename
+                loc_width = LOC_WIDTH_SHORT
+            elif pathname:
+                location = pathname
+                loc_width = LOC_WIDTH_LONG
+            else:
+                location = "unknown"
+                loc_width = LOC_WIDTH_SHORT
+
+            message_parts = []
+            event = event_dict.pop("event", "")
+            if event:
+                message_parts.append(event)
+
+            if use_colors:
+                colored_timestamp = f"{DIM}{timestamp}{RESET}"
+                color = LEVEL_COLORS.get(lvl, "")
+                colored_level = f"{color}{lvl:<7}{RESET}"
+            else:
+                colored_timestamp = timestamp
+                colored_level = f"{lvl:<7}"
+
+            header = f"[{colored_timestamp}] [{colored_level}] [{location:<{loc_width}}] "
+            visible_header = f"[{timestamp}] [{lvl:<7}] [{location:<{loc_width}}] "
+
+            extra = {
+                k: v
+                for k, v in event_dict.items()
+                if k not in ("service", "env", "version", "func_name")
+            }
+            if extra:
+                padding = " " * len(visible_header)
+                for key, value in extra.items():
+                    message_parts.append(f"\n{padding}- {key}: {value}")
+
+            return f"{header}{''.join(message_parts)}"
+
+        render_processors = [
+            structlog.dev.set_exc_info,
+            structlog.processors.format_exc_info,
+            custom_formatter,
+        ]
+
+    structlog.configure(
+        processors=base_processors + render_processors,
+        wrapper_class=structlog.make_filtering_bound_logger(level),
+        context_class=dict,
+        logger_factory=structlog.WriteLoggerFactory(sys.stderr),
+        cache_logger_on_first_use=True,
+    )
+
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(service=service_name)
+
+
+def configure_stdlib_logging(log_level: str = "INFO") -> None:
+    """Bridge Python stdlib logging (uvicorn, httpx, etc.) through structlog.
+
+    Must be called after configure_logging() so _shared_processors is populated.
+    Uvicorn access logs are suppressed here because the ASGI middleware handles
+    request logging with richer context (request_id, duration_ms).
+    """
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "handlers": {
+                "structlog": {
+                    "class": "logging.StreamHandler",
+                    "formatter": "structlog",
+                    "stream": "ext://sys.stderr",
+                }
+            },
+            "formatters": {
+                "structlog": {
+                    "()": structlog.stdlib.ProcessorFormatter,
+                    "processors": [
+                        structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                        drop_color_message_key,
+                        structlog.processors.JSONRenderer(),
+                    ],
+                    "foreign_pre_chain": list(_shared_processors),
+                }
+            },
+            "root": {"handlers": ["structlog"], "level": log_level},
+            "loggers": {
+                # Third-party libs: pass through at ERROR+ only.
+                # suppress_third_party_noise processor drops WARNING/INFO/DEBUG from
+                # site-packages at the structlog layer, but setting the stdlib level
+                # to ERROR here prevents them from even entering the pipeline.
+                "httpcore": {"level": "ERROR", "propagate": True},
+                "httpx": {"level": "ERROR", "propagate": True},
+                "urllib3": {"level": "ERROR", "propagate": True},
+                "boto3": {"level": "ERROR", "propagate": True},
+                "botocore": {"level": "ERROR", "propagate": True},
+                # opensearch-py logs every HTTP request (incl. 401 health checks) at WARNING.
+                # ERROR-only keeps the pipeline clean; true connection failures still surface.
+                "opensearch": {"level": "ERROR", "propagate": True},
+                "opensearchpy": {"level": "ERROR", "propagate": True},
+                "opensearchpy.trace": {"level": "CRITICAL", "propagate": False},
+                "elastic_transport": {"level": "ERROR", "propagate": True},
+                # uvicorn.access is replaced by RequestLoggingMiddleware
+                "uvicorn.access": {"level": "CRITICAL", "propagate": False},
+                "uvicorn.error": {"level": "WARNING", "propagate": True},
+            },
+        }
+    )
+
+
+def get_logger(name: str = None) -> structlog.BoundLogger:
+    """Get a configured logger instance."""
+    if name:
+        return structlog.get_logger(name)
+    return structlog.get_logger()
+
+
+def log_bootstrap_env(logger, stage: str) -> None:
+    """Log effective bootstrap / run-mode env values for a given stage.
+
+    Logs parsed booleans from config.settings (OpenSearch bootstrap, JWT auth, run mode).
+    """
+    from config.settings import (
+        OPENRAG_BOOTSTRAP_OS_SECURITY_ON_STARTUP,
+        OPENRAG_SKIP_OS_SECURITY_SETUP,
+        get_jwt_issuer_verify_tls,
+        get_jwt_verify_signature,
+    )
+    from utils.run_mode_utils import get_run_mode
+
+    logger.info(
+        "OpenRAG run mode details",
+        stage=stage,
+        run_mode=get_run_mode(),
+        bootstrap_os_security_on_startup=OPENRAG_BOOTSTRAP_OS_SECURITY_ON_STARTUP,
+        skip_os_security_setup=OPENRAG_SKIP_OS_SECURITY_SETUP,
+        jwt_verify_signature=get_jwt_verify_signature(),
+        jwt_issuer_verify_tls=get_jwt_issuer_verify_tls(),
+    )
+
+
+def configure_from_env() -> None:
+    """Configure logging from environment variables."""
+    from utils.version_utils import OPENRAG_VERSION  # avoid circular import at module level
+
+    log_level = os.getenv("LOG_LEVEL", "INFO")
+    json_logs = os.getenv("LOG_FORMAT", "").lower() == "json"
+    service_name = os.getenv("SERVICE_NAME", "openrag")
+    app_env = os.getenv("APP_ENV", "production")
+
+    configure_logging(
+        log_level=log_level,
+        json_logs=json_logs,
+        service_name=service_name,
+        app_env=app_env,
+        app_version=OPENRAG_VERSION,
+    )
+    configure_stdlib_logging(log_level=log_level)

@@ -1,0 +1,1171 @@
+"use client";
+
+import { Loader2, Zap } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
+import { ProtectedRoute } from "@/components/protected-route";
+import { Button } from "@/components/ui/button";
+import { useIsCloudBrand } from "@/contexts/brand-context";
+import { type EndpointType, useChat } from "@/contexts/chat-context";
+import { useTask } from "@/contexts/task-context";
+import { useOnboardingState } from "@/hooks/use-onboarding-state";
+import { useChatStreaming } from "@/hooks/useChatStreaming";
+import { trackLLMCall } from "@/lib/analytics";
+import {
+  dedupeConsecutiveErrorMessages,
+  formatProviderErrorMessage,
+  looksLikeProviderErrorContent,
+} from "@/lib/chat-stream-errors";
+import { FILE_CONFIRMATION, FILES_REGEX } from "@/lib/constants";
+import { buildSearchPayloadFilters } from "@/lib/filter-normalization";
+import { uploadFileForContext } from "@/lib/upload-utils";
+import { cn } from "@/lib/utils";
+import { useGetConversationsQuery } from "../api/queries/useGetConversationsQuery";
+import { useGetNudgesQuery } from "../api/queries/useGetNudgesQuery";
+import { useGetSettingsQuery } from "../api/queries/useGetSettingsQuery";
+import { AssistantMessage } from "./_components/assistant-message";
+import { ChatInput, type ChatInputHandle } from "./_components/chat-input";
+import { ErrorMessage } from "./_components/error-message";
+import Nudges from "./_components/nudges";
+import { UserMessage } from "./_components/user-message";
+import type {
+  FunctionCall,
+  KnowledgeFilterData,
+  Message,
+  RequestBody,
+  ToolCallResult,
+} from "./_types/types";
+import { INITIAL_ASSISTANT_MESSAGE } from "./_types/types";
+
+function ChatPage() {
+  const isDebugMode = process.env.NEXT_PUBLIC_OPENRAG_DEBUG === "true";
+  const {
+    endpoint,
+    setEndpoint,
+    currentConversationId,
+    conversationData,
+    setCurrentConversationId,
+    addConversationDoc,
+    forkFromResponse,
+    refreshConversations,
+    refreshConversationsSilent,
+    refreshTrigger,
+    refreshTriggerSilent,
+    previousResponseIds,
+    setPreviousResponseIds,
+    placeholderConversation,
+    conversationFilter,
+    setConversationFilter,
+    loading,
+    setLoading,
+  } = useChat();
+  const [messages, setMessages] = useState<Message[]>([
+    INITIAL_ASSISTANT_MESSAGE,
+  ]);
+  const [input, setInput] = useState("");
+  const { setChatError } = useChat();
+  const [asyncMode, setAsyncMode] = useState(true);
+  const [expandedFunctionCalls, setExpandedFunctionCalls] = useState<
+    Set<string>
+  >(new Set());
+  // previousResponseIds now comes from useChat context
+  const [isUploading, setIsUploading] = useState(false);
+  const [isFilterHighlighted, setIsFilterHighlighted] = useState(false);
+  const [isUserInteracting, setIsUserInteracting] = useState(false);
+  const [isForkingInProgress, setIsForkingInProgress] = useState(false);
+  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
+  const [waitingTooLong, setWaitingTooLong] = useState(false);
+
+  const chatInputRef = useRef<ChatInputHandle>(null);
+
+  const { scrollToBottom } = useStickToBottomContext();
+
+  const lastLoadedConversationRef = useRef<string | null>(null);
+  // Set when a live stream fails so history sync cannot replace one error card
+  // with Langflow's duplicated copies of the same failure.
+  const liveErrorConversationRef = useRef<string | null>(null);
+  const { addTask } = useTask();
+
+  // Check if chat history is loading
+  const { isLoading: isConversationsLoading } = useGetConversationsQuery(
+    endpoint,
+    refreshTrigger + refreshTriggerSilent,
+  );
+
+  // Use conversation-specific filter instead of global filter
+  const selectedFilter = conversationFilter;
+
+  // Parse the conversation filter data
+  const parsedFilterData = useMemo(() => {
+    if (!selectedFilter?.query_data) return null;
+    try {
+      return JSON.parse(selectedFilter.query_data);
+    } catch (error) {
+      console.error("Error parsing filter data:", error);
+      return null;
+    }
+  }, [selectedFilter]);
+
+  // Get settings for model info used in analytics
+  const { data: settings } = useGetSettingsQuery();
+
+  // Use the chat streaming hook
+  const apiEndpoint = endpoint === "chat" ? "/api/chat" : "/api/langflow";
+  const {
+    streamingMessage,
+    sendMessage: sendStreamingMessage,
+    abortStream,
+    isLoading: isChatStreaming,
+  } = useChatStreaming({
+    endpoint: apiEndpoint,
+    onComplete: (message, responseId) => {
+      setLoading(false);
+      setWaitingTooLong(false);
+
+      setMessages((prev) => {
+        if (!message.error) {
+          return [...prev, message];
+        }
+        // One error card per failure — drop a trailing duplicate if present.
+        const withoutTrailingDup = [...prev];
+        while (
+          withoutTrailingDup.length > 0 &&
+          withoutTrailingDup[withoutTrailingDup.length - 1]?.role ===
+            "assistant" &&
+          withoutTrailingDup[withoutTrailingDup.length - 1]?.error &&
+          withoutTrailingDup[withoutTrailingDup.length - 1]?.content ===
+            message.content
+        ) {
+          withoutTrailingDup.pop();
+        }
+        return [...withoutTrailingDup, message];
+      });
+
+      if (message.error) {
+        // Latch banner deep-probe so it shows the same provider/model error.
+        setChatError(true);
+        // Sidebar id stays on currentConversationId; onError clears Langflow chaining.
+        if (responseId) {
+          liveErrorConversationRef.current = responseId;
+          if (!currentConversationId) {
+            setCurrentConversationId(responseId);
+            refreshConversations(true);
+            if (conversationFilter && typeof window !== "undefined") {
+              localStorage.setItem(
+                `conversation_filter_${responseId}`,
+                conversationFilter.id,
+              );
+            }
+          } else {
+            refreshConversationsSilent();
+          }
+        }
+        return;
+      }
+
+      // Successful turn — drop the banner deep-probe latch.
+      setChatError(false);
+
+      trackLLMCall({
+        mode: "chat",
+        model: settings?.agent?.llm_model,
+        inputTokens: message.usage?.input_tokens,
+        outputTokens: message.usage?.output_tokens,
+      });
+      if (responseId) {
+        cancelNudges();
+        // Langflow session id for chaining; sidebar id stays on currentConversationId.
+        setPreviousResponseIds((prev) => ({
+          ...prev,
+          [endpoint]: responseId,
+        }));
+
+        if (!currentConversationId) {
+          setCurrentConversationId(responseId);
+          refreshConversations(true);
+        } else {
+          refreshConversationsSilent();
+        }
+
+        // Save filter association for this response
+        if (conversationFilter && typeof window !== "undefined") {
+          const stableId = currentConversationId || responseId;
+          const newKey = `conversation_filter_${stableId}`;
+          localStorage.setItem(newKey, conversationFilter.id);
+        }
+      }
+    },
+    onError: (error) => {
+      console.error("Streaming error:", error);
+      setLoading(false);
+      setWaitingTooLong(false);
+      // Set chat error flag to trigger test_completion=true on health checks.
+      setChatError(true);
+      // Clear Langflow session chaining; conversation_id keeps the sidebar thread.
+      setPreviousResponseIds((prev) => ({
+        ...prev,
+        [endpoint]: null,
+      }));
+    },
+  });
+
+  // Show warning if waiting too long (20 seconds)
+  const hasStreamingMessage = !!streamingMessage;
+  useEffect(() => {
+    let timeoutId: NodeJS.Timeout | null = null;
+
+    if (isChatStreaming && !hasStreamingMessage) {
+      timeoutId = setTimeout(() => {
+        setWaitingTooLong(true);
+      }, 20000); // 20 seconds
+    } else {
+      setWaitingTooLong(false);
+    }
+
+    return () => {
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+  }, [isChatStreaming, hasStreamingMessage]);
+
+  const handleEndpointChange = (newEndpoint: EndpointType) => {
+    setEndpoint(newEndpoint);
+    // Clear the conversation when switching endpoints to avoid response ID conflicts
+    setMessages([]);
+    setPreviousResponseIds({ chat: null, langflow: null });
+  };
+
+  const handleFileUpload = async (file: File) => {
+    if (isUploading) return;
+
+    setIsUploading(true);
+    setLoading(true);
+
+    try {
+      const result = await uploadFileForContext(
+        file,
+        endpoint,
+        previousResponseIds[endpoint],
+      );
+
+      if (result.type === "task") {
+        addTask(result.taskId, { source: "file" });
+        return { type: "task-queued" as const };
+      }
+
+      // Direct response path
+      const uploadMessage: Message = {
+        role: "user",
+        content: `I'm uploading a document called "${result.filename}". Here is its content:`,
+        timestamp: new Date(),
+      };
+      const confirmationMessage: Message = {
+        role: "assistant",
+        content: `Confirmed`,
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, uploadMessage, confirmationMessage]);
+
+      addConversationDoc(result.filename);
+
+      setPreviousResponseIds((prev) => ({
+        ...prev,
+        [endpoint]: result.responseId,
+      }));
+      if (!currentConversationId) {
+        setCurrentConversationId(result.responseId);
+        refreshConversations(true);
+      } else {
+        refreshConversationsSilent();
+      }
+      return result.responseId;
+    } catch (error) {
+      console.error("Upload failed:", error);
+      setChatError(true);
+      const errorMessage: Message = {
+        role: "assistant",
+        content: `❌ Failed to process document. Please try again.`,
+        timestamp: new Date(),
+        error: true,
+      };
+      setMessages((prev) => [...prev.slice(0, -1), errorMessage]);
+    } finally {
+      setIsUploading(false);
+      setLoading(false);
+    }
+  };
+
+  const handleFilePickerClick = () => {
+    chatInputRef.current?.clickFileInput();
+  };
+
+  const handleFilterSelect = (filter: KnowledgeFilterData | null) => {
+    // Update conversation-specific filter
+    setConversationFilter(filter);
+    setIsFilterHighlighted(false);
+  };
+
+  // Auto-focus the input on component mount
+  useEffect(() => {
+    chatInputRef.current?.focusInput();
+  }, []);
+
+  // Explicitly handle external new conversation trigger
+  useEffect(() => {
+    const handleNewConversation = () => {
+      // Abort any in-flight streaming so it doesn't bleed into new chat
+      abortStream();
+      // Reset chat UI even if context state was already 'new'
+      setMessages([INITIAL_ASSISTANT_MESSAGE]);
+      setInput("");
+      setExpandedFunctionCalls(new Set());
+      setIsFilterHighlighted(false);
+      setLoading(false);
+      lastLoadedConversationRef.current = null;
+      liveErrorConversationRef.current = null;
+
+      // Focus input after a short delay to ensure rendering is complete
+      setTimeout(() => {
+        chatInputRef.current?.focusInput();
+      }, 100);
+    };
+
+    const handleFocusInput = () => {
+      chatInputRef.current?.focusInput();
+    };
+
+    window.addEventListener("newConversation", handleNewConversation);
+    window.addEventListener("focusInput", handleFocusInput);
+    return () => {
+      window.removeEventListener("newConversation", handleNewConversation);
+      window.removeEventListener("focusInput", handleFocusInput);
+    };
+  }, [abortStream, setLoading]);
+
+  // Load conversation data from context
+  useEffect(() => {
+    let focusTimeoutId: NodeJS.Timeout;
+    // Only load conversation data when remote history should win:
+    // - Switching to a different conversation always loads remote.
+    // - Same conversation: never clobber local turns that are still ahead
+    //   (failed sends append user+error before history refreshes; syncing
+    //   stale remote would wipe them and retries then duplicate in Langflow).
+    const conversationId = conversationData?.response_id ?? null;
+    const isSwitchingConversation =
+      conversationId != null &&
+      lastLoadedConversationRef.current != null &&
+      lastLoadedConversationRef.current !== conversationId;
+    const isFirstLoadOfConversation =
+      conversationId != null &&
+      lastLoadedConversationRef.current !== conversationId;
+    const remoteMessageCount = conversationData?.messages?.length ?? 0;
+    const hasMessageCountChanged = remoteMessageCount !== messages.length;
+    const localMessagesAhead = messages.length > remoteMessageCount;
+    // After a live failed send we already appended the error locally. History
+    // often returns the same provider failure repeated from Langflow — do not
+    // clobber the live transcript for that conversation id.
+    const skipSyncAfterLiveError =
+      conversationId != null &&
+      liveErrorConversationRef.current === conversationId &&
+      !isSwitchingConversation;
+    const shouldSyncSameConversation =
+      !isChatStreaming &&
+      hasMessageCountChanged &&
+      !localMessagesAhead &&
+      !isUserInteracting &&
+      !isForkingInProgress;
+
+    if (skipSyncAfterLiveError) {
+      lastLoadedConversationRef.current = conversationId;
+      setPreviousResponseIds((prev) => ({
+        ...prev,
+        [conversationData?.endpoint ?? endpoint]: null,
+      }));
+    } else if (
+      conversationData?.messages &&
+      (isSwitchingConversation ||
+        (isFirstLoadOfConversation && !localMessagesAhead) ||
+        (!isFirstLoadOfConversation && shouldSyncSameConversation))
+    ) {
+      // Convert backend message format to frontend Message interface
+      const convertedMessages: Message[] = conversationData.messages.map(
+        (msg: {
+          role: string;
+          content: string;
+          timestamp?: string;
+          response_id?: string;
+          error?: boolean;
+          chunks?: Array<{
+            item?: {
+              type?: string;
+              tool_name?: string;
+              id?: string;
+              inputs?: unknown;
+              results?: unknown;
+              status?: string;
+            };
+            delta?: {
+              tool_calls?: Array<{
+                id?: string;
+                function?: { name?: string; arguments?: string };
+                type?: string;
+              }>;
+            };
+            type?: string;
+            result?: unknown;
+            output?: unknown;
+            response?: unknown;
+          }>;
+          response_data?: unknown;
+        }) => {
+          const isProviderError =
+            Boolean(msg.error) ||
+            (msg.role === "assistant" &&
+              looksLikeProviderErrorContent(msg.content || ""));
+          const message: Message = {
+            role: msg.role as "user" | "assistant",
+            content: isProviderError
+              ? formatProviderErrorMessage(msg.content)
+              : msg.content,
+            timestamp: new Date(msg.timestamp || new Date()),
+            error: isProviderError,
+          };
+
+          // Extract function calls from chunks or response_data
+          if (msg.role === "assistant" && (msg.chunks || msg.response_data)) {
+            const functionCalls: FunctionCall[] = [];
+
+            // Process chunks (streaming data)
+            if (msg.chunks && Array.isArray(msg.chunks)) {
+              for (const chunk of msg.chunks) {
+                // Handle Langflow format: chunks[].item.tool_call
+                if (chunk.item && chunk.item.type === "tool_call") {
+                  const toolCall = chunk.item;
+                  functionCalls.push({
+                    id: toolCall.id || "",
+                    name: toolCall.tool_name || "unknown",
+                    arguments:
+                      (toolCall.inputs as Record<string, unknown>) || {},
+                    argumentsString: JSON.stringify(toolCall.inputs || {}),
+                    result: toolCall.results as
+                      | Record<string, unknown>
+                      | ToolCallResult[],
+                    status:
+                      (toolCall.status as "pending" | "completed" | "error") ||
+                      "completed",
+                    type: "tool_call",
+                  });
+                }
+                // Handle OpenAI format: chunks[].delta.tool_calls
+                else if (chunk.delta?.tool_calls) {
+                  for (const toolCall of chunk.delta.tool_calls) {
+                    if (toolCall.function) {
+                      functionCalls.push({
+                        id: toolCall.id || "",
+                        name: toolCall.function.name || "unknown",
+                        arguments: toolCall.function.arguments
+                          ? JSON.parse(toolCall.function.arguments)
+                          : {},
+                        argumentsString: toolCall.function.arguments || "",
+                        status: "completed",
+                        type: toolCall.type || "function",
+                      });
+                    }
+                  }
+                }
+                // Process tool call results from chunks
+                if (
+                  chunk.type === "response.tool_call.result" ||
+                  chunk.type === "tool_call_result"
+                ) {
+                  const lastCall = functionCalls[functionCalls.length - 1];
+                  if (lastCall) {
+                    lastCall.result =
+                      (chunk.result as
+                        | Record<string, unknown>
+                        | ToolCallResult[]) ||
+                      (chunk as Record<string, unknown>);
+                    lastCall.status = "completed";
+                  }
+                }
+              }
+            }
+
+            // Process response_data (non-streaming data)
+            if (msg.response_data && typeof msg.response_data === "object") {
+              // Look for tool_calls in various places in the response data
+              const responseData =
+                typeof msg.response_data === "string"
+                  ? JSON.parse(msg.response_data)
+                  : msg.response_data;
+
+              if (
+                responseData.tool_calls &&
+                Array.isArray(responseData.tool_calls)
+              ) {
+                for (const toolCall of responseData.tool_calls) {
+                  functionCalls.push({
+                    id: toolCall.id,
+                    name: toolCall.function?.name || toolCall.name,
+                    arguments:
+                      toolCall.function?.arguments || toolCall.arguments,
+                    argumentsString:
+                      typeof (
+                        toolCall.function?.arguments || toolCall.arguments
+                      ) === "string"
+                        ? toolCall.function?.arguments || toolCall.arguments
+                        : JSON.stringify(
+                            toolCall.function?.arguments || toolCall.arguments,
+                          ),
+                    result: toolCall.result,
+                    status: "completed",
+                    type: toolCall.type || "function",
+                  });
+                }
+              }
+            }
+
+            if (functionCalls.length > 0) {
+              message.functionCalls = functionCalls;
+            }
+
+            // Extract usage data from response_data
+            if (msg.response_data && typeof msg.response_data === "object") {
+              const responseData =
+                typeof msg.response_data === "string"
+                  ? JSON.parse(msg.response_data)
+                  : msg.response_data;
+              if (responseData.usage) {
+                message.usage = responseData.usage;
+              }
+            }
+          }
+
+          return message;
+        },
+      );
+
+      // Sort messages by timestamp to ensure they are in chronological order
+      const sortedMessages = [...convertedMessages].sort((a, b) => {
+        const aTime = a.timestamp.getTime();
+        const bTime = b.timestamp.getTime();
+        if (isNaN(aTime) && isNaN(bTime)) return 0;
+        if (isNaN(aTime)) return 1;
+        if (isNaN(bTime)) return -1;
+        return aTime - bTime;
+      });
+
+      const dedupedMessages = dedupeConsecutiveErrorMessages(sortedMessages);
+      setMessages(dedupedMessages);
+      lastLoadedConversationRef.current = conversationData.response_id;
+      if (liveErrorConversationRef.current === conversationData.response_id) {
+        liveErrorConversationRef.current = null;
+      }
+
+      // Don't chain a session that ended in an error — Langflow often collapses
+      // follow-ups to "An unknown error occurred." and hides the real failure.
+      const lastConverted = dedupedMessages[dedupedMessages.length - 1];
+      setPreviousResponseIds((prev) => ({
+        ...prev,
+        [conversationData.endpoint]: lastConverted?.error
+          ? null
+          : conversationData.response_id,
+      }));
+
+      // Focus input when loading a conversation
+      focusTimeoutId = setTimeout(() => {
+        chatInputRef.current?.focusInput();
+      }, 100);
+    } else if (!conversationData) {
+      // No conversation selected (new conversation)
+      lastLoadedConversationRef.current = null;
+    }
+
+    return () => clearTimeout(focusTimeoutId);
+  }, [
+    conversationData,
+    isUserInteracting,
+    isForkingInProgress,
+    setPreviousResponseIds,
+    isChatStreaming,
+    messages.length,
+    endpoint,
+  ]);
+
+  // Handle new conversation creation - only reset messages when placeholderConversation is set
+  useEffect(() => {
+    let focusTimeoutId: NodeJS.Timeout;
+    if (placeholderConversation && currentConversationId === null) {
+      setMessages([INITIAL_ASSISTANT_MESSAGE]);
+      lastLoadedConversationRef.current = null;
+
+      // Focus input when starting a new conversation
+      focusTimeoutId = setTimeout(() => {
+        chatInputRef.current?.focusInput();
+      }, 100);
+    }
+    return () => clearTimeout(focusTimeoutId);
+  }, [placeholderConversation, currentConversationId]);
+
+  const { isOnboardingComplete } = useOnboardingState();
+
+  // Prepare filters for nudges (same as chat)
+  const processedFiltersForNudges = parsedFilterData?.filters
+    ? (() => {
+        return buildSearchPayloadFilters(parsedFilterData.filters);
+      })()
+    : undefined;
+
+  const { data: nudges = [], cancel: cancelNudges } = useGetNudgesQuery(
+    {
+      chatId: previousResponseIds[endpoint],
+      filters: processedFiltersForNudges,
+      limit: parsedFilterData?.limit ?? 3,
+      scoreThreshold: parsedFilterData?.scoreThreshold ?? 0,
+    },
+    {
+      enabled: isOnboardingComplete && !isConversationsLoading, // Only fetch nudges after onboarding is complete AND chat history is not loading
+    },
+  );
+
+  const handleSSEStream = async (
+    userMessage: Message,
+    previousResponseId?: string,
+  ) => {
+    // Prepare filters
+    const processedFilters = parsedFilterData?.filters
+      ? (() => {
+          return buildSearchPayloadFilters(parsedFilterData.filters);
+        })()
+      : undefined;
+
+    // OpenRAG sidebar thread vs Langflow session are separate:
+    // - conversationId keeps the same list entry after errors
+    // - previousResponseId is omitted after an error so Langflow starts fresh
+    const lastAssistant = [...messages]
+      .reverse()
+      .find((message) => message.role === "assistant");
+    const langflowSessionId = lastAssistant?.error
+      ? undefined
+      : previousResponseId || previousResponseIds[endpoint] || undefined;
+
+    // Use the hook to send the message
+    await sendStreamingMessage({
+      prompt: userMessage.content,
+      previousResponseId: langflowSessionId,
+      conversationId: currentConversationId || undefined,
+      filters: processedFilters,
+      filter_id: conversationFilter?.id, // ✅ Add filter_id for this conversation
+      limit: parsedFilterData?.limit ?? 10,
+      scoreThreshold: parsedFilterData?.scoreThreshold ?? 0,
+    });
+    scrollToBottom({
+      animation: "smooth",
+      duration: 1000,
+    });
+  };
+
+  const handleSendMessage = async (
+    inputMessage: string,
+    previousResponseId?: string,
+  ) => {
+    if (!inputMessage.trim() || loading) return;
+
+    const userMessage: Message = {
+      role: "user",
+      content: inputMessage.trim(),
+      timestamp: new Date(),
+    };
+
+    if (messages.length === 1) {
+      setMessages([userMessage]);
+    } else {
+      setMessages((prev) => [...prev, userMessage]);
+    }
+    setInput("");
+    setLoading(true);
+    setIsFilterHighlighted(false);
+
+    scrollToBottom({
+      animation: "smooth",
+      duration: 1000,
+    });
+
+    if (asyncMode) {
+      await handleSSEStream(userMessage, previousResponseId);
+    } else {
+      // Original non-streaming logic
+      try {
+        const apiEndpoint = endpoint === "chat" ? "/api/chat" : "/api/langflow";
+
+        const requestBody: RequestBody = {
+          prompt: userMessage.content,
+          ...(parsedFilterData?.filters
+            ? (() => {
+                const processedFilters = buildSearchPayloadFilters(
+                  parsedFilterData.filters,
+                );
+                return processedFilters ? { filters: processedFilters } : {};
+              })()
+            : {}),
+          limit: parsedFilterData?.limit ?? 10,
+          scoreThreshold: parsedFilterData?.scoreThreshold ?? 0,
+        };
+
+        // Add previous_response_id if we have one for this endpoint
+        const currentResponseId = previousResponseIds[endpoint];
+        if (currentResponseId) {
+          requestBody.previous_response_id = currentResponseId;
+        }
+
+        // Add filter_id if a filter is selected for this conversation
+        if (conversationFilter) {
+          requestBody.filter_id = conversationFilter.id;
+        }
+
+        const response = await fetch(apiEndpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(requestBody),
+        });
+
+        const result = await response.json();
+
+        if (response.ok) {
+          const assistantMessage: Message = {
+            role: "assistant",
+            content: result.response,
+            timestamp: new Date(),
+            usage: result.usage,
+          };
+          setMessages((prev) => [...prev, assistantMessage]);
+          setChatError(false);
+          if (result.response_id) {
+            cancelNudges();
+          }
+
+          // Store the response ID if present for this endpoint
+          if (result.response_id) {
+            setPreviousResponseIds((prev) => ({
+              ...prev,
+              [endpoint]: result.response_id,
+            }));
+
+            // If this is a new conversation (no currentConversationId), set it now
+            if (!currentConversationId) {
+              setCurrentConversationId(result.response_id);
+              refreshConversations(true);
+            } else {
+              // For existing conversations, do a silent refresh to keep backend in sync
+              refreshConversationsSilent();
+            }
+
+            // Carry forward the filter association to the new response_id
+            if (conversationFilter && typeof window !== "undefined") {
+              const newKey = `conversation_filter_${result.response_id}`;
+              localStorage.setItem(newKey, conversationFilter.id);
+            }
+          }
+        } else {
+          console.error("Chat failed:", result.error);
+          // Set chat error flag to trigger test_completion=true on health checks
+          setChatError(true);
+          const errorMessage: Message = {
+            role: "assistant",
+            content: "Sorry, I encountered an error. Please try again.",
+            timestamp: new Date(),
+            error: true,
+          };
+          setMessages((prev) => [...prev, errorMessage]);
+        }
+      } catch (error) {
+        console.error("Chat error:", error);
+        // Set chat error flag to trigger test_completion=true on health checks
+        setChatError(true);
+        const errorMessage: Message = {
+          role: "assistant",
+          content:
+            "Sorry, I couldn't connect to the chat service. Please try again.",
+          timestamp: new Date(),
+          error: true,
+        };
+        setMessages((prev) => [...prev, errorMessage]);
+      }
+    }
+
+    setLoading(false);
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    // Check if there's an uploaded file and upload it first
+    let uploadedResponseId: string | null = null;
+    if (uploadedFile) {
+      const uploadResult = await handleFileUpload(uploadedFile);
+      setUploadedFile(null);
+
+      if (uploadResult && typeof uploadResult === "object") {
+        // File is being processed asynchronously — don't send the message yet.
+        // The user can submit again once the task completes.
+        return;
+      }
+
+      if (uploadResult) {
+        uploadedResponseId = uploadResult;
+        setPreviousResponseIds((prev) => ({
+          ...prev,
+          [endpoint]: uploadResult,
+        }));
+      }
+    }
+
+    // Only send message if there's input text
+    if (input.trim() || uploadedFile) {
+      // Pass the responseId from upload (if any) to handleSendMessage
+      handleSendMessage(
+        !input.trim() ? FILE_CONFIRMATION : input,
+        uploadedResponseId || undefined,
+      );
+    }
+  };
+
+  const toggleFunctionCall = (functionCallId: string) => {
+    setExpandedFunctionCalls((prev) => {
+      const newSet = new Set(prev);
+      if (newSet.has(functionCallId)) {
+        newSet.delete(functionCallId);
+      } else {
+        newSet.add(functionCallId);
+      }
+      return newSet;
+    });
+  };
+
+  const handleForkConversation = (
+    messageIndex: number,
+    event?: React.MouseEvent,
+  ) => {
+    // Prevent any default behavior and stop event propagation
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+
+    // Set interaction state to prevent auto-scroll interference
+    setIsUserInteracting(true);
+    setIsForkingInProgress(true);
+
+    // Get messages up to and including the selected assistant message
+    const messagesToKeep = messages.slice(0, messageIndex + 1);
+
+    // The selected message should be an assistant message (since fork button is only on assistant messages)
+    const forkedMessage = messages[messageIndex];
+    if (forkedMessage.role !== "assistant") {
+      console.error("Fork button should only be on assistant messages");
+      setIsUserInteracting(false);
+      setIsForkingInProgress(false);
+      return;
+    }
+
+    // For forking, we want to continue from the response_id of the assistant message we're forking from
+    // Since we don't store individual response_ids per message yet, we'll use the current conversation's response_id
+    // This means we're continuing the conversation thread from that point
+    const responseIdToForkFrom =
+      currentConversationId || previousResponseIds[endpoint];
+
+    // Create a new conversation by properly forking
+    setMessages(messagesToKeep);
+
+    // Use the chat context's fork method which handles creating a new conversation properly
+    if (forkFromResponse) {
+      forkFromResponse(responseIdToForkFrom || "");
+    } else {
+      // Fallback to manual approach
+      setCurrentConversationId(null); // This creates a new conversation thread
+
+      // Set the response_id we want to continue from as the previous response ID
+      // This tells the backend to continue the conversation from this point
+      setPreviousResponseIds((prev) => ({
+        ...prev,
+        [endpoint]: responseIdToForkFrom,
+      }));
+    }
+
+    // Reset interaction state after a longer delay to ensure all effects complete
+    setTimeout(() => {
+      setIsUserInteracting(false);
+      setIsForkingInProgress(false);
+    }, 500);
+
+    // The original conversation remains unchanged in the sidebar
+    // This new forked conversation will get its own response_id when the user sends the next message
+  };
+
+  const handleSuggestionClick = (suggestion: string) => {
+    handleSendMessage(suggestion);
+  };
+
+  return (
+    <>
+      {/* Debug header - only show in debug mode */}
+      {isDebugMode && (
+        <div className="flex items-center justify-between p-6">
+          <div className="flex items-center gap-2"></div>
+          <div className="flex items-center gap-4">
+            {/* Async Mode Toggle */}
+            <div className="flex items-center gap-2 bg-muted/50 rounded-lg p-1">
+              <Button
+                variant={!asyncMode ? "default" : "ghost"}
+                size="sm"
+                onClick={() => setAsyncMode(false)}
+                className="h-7 text-xs"
+              >
+                Streaming Off
+              </Button>
+              <Button
+                variant={asyncMode ? "default" : "ghost"}
+                size="sm"
+                onClick={() => setAsyncMode(true)}
+                className="h-7 text-xs"
+              >
+                <Zap className="h-3 w-3 mr-1" />
+                Streaming On
+              </Button>
+            </div>
+            {/* Endpoint Toggle */}
+            <div className="flex items-center gap-2 bg-muted/50 rounded-lg p-1">
+              <Button
+                variant={endpoint === "chat" ? "default" : "ghost"}
+                size="sm"
+                onClick={() => handleEndpointChange("chat")}
+                className="h-7 text-xs"
+              >
+                Chat
+              </Button>
+              <Button
+                variant={endpoint === "langflow" ? "default" : "ghost"}
+                size="sm"
+                onClick={() => handleEndpointChange("langflow")}
+                className="h-7 text-xs"
+              >
+                Langflow
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <StickToBottom.Content
+        className={cn("flex flex-col min-h-full overflow-x-hidden p-6")}
+      >
+        <div className="flex flex-col place-self-center space-y-6 max-w-content w-full mx-auto">
+          {messages.length === 0 && !streamingMessage ? (
+            <div className="flex items-center justify-center h-full text-muted-foreground">
+              <div className="text-center">
+                {isUploading ? (
+                  <>
+                    <Loader2 className="h-12 w-12 mx-auto mb-4 animate-spin" />
+                    <p>Processing your document...</p>
+                    <p className="text-sm mt-2">This may take a few moments</p>
+                  </>
+                ) : null}
+              </div>
+            </div>
+          ) : (
+            <>
+              {messages.map((message, index) =>
+                message.role === "user"
+                  ? (messages[index]?.content.match(FILES_REGEX)?.[0] ??
+                      null) === null && (
+                      <div
+                        key={`${currentConversationId ?? "new"}-${
+                          message.role
+                        }-${index}-${message.timestamp?.getTime()}`}
+                        className="space-y-6 group"
+                      >
+                        <UserMessage
+                          animate={
+                            message.source
+                              ? message.source !== "langflow"
+                              : false
+                          }
+                          content={
+                            index >= 2 &&
+                            (messages[index - 2]?.content.match(
+                              FILES_REGEX,
+                            )?.[0] ??
+                              undefined) &&
+                            message.content === FILE_CONFIRMATION
+                              ? undefined
+                              : message.content
+                          }
+                          files={
+                            index >= 2
+                              ? (messages[index - 2]?.content.match(
+                                  FILES_REGEX,
+                                )?.[0] ?? undefined)
+                              : undefined
+                          }
+                        />
+                      </div>
+                    )
+                  : message.role === "assistant" &&
+                    (index < 1 ||
+                      (messages[index - 1]?.content.match(FILES_REGEX)?.[0] ??
+                        null) === null) && (
+                      <div
+                        key={`${currentConversationId ?? "new"}-${
+                          message.role
+                        }-${index}-${message.timestamp?.getTime()}`}
+                        className="space-y-6 group"
+                      >
+                        {message.error ? (
+                          <ErrorMessage
+                            content={message.content}
+                            animate={false}
+                          />
+                        ) : (
+                          <AssistantMessage
+                            content={message.content}
+                            functionCalls={message.functionCalls}
+                            messageIndex={index}
+                            expandedFunctionCalls={expandedFunctionCalls}
+                            onToggle={toggleFunctionCall}
+                            showForkButton={endpoint === "chat"}
+                            onFork={(e) => handleForkConversation(index, e)}
+                            animate={false}
+                            isInactive={index < messages.length - 1}
+                            isInitialGreeting={
+                              index === 0 &&
+                              messages.length === 1 &&
+                              message.content ===
+                                INITIAL_ASSISTANT_MESSAGE.content
+                            }
+                            usage={message.usage}
+                            timestamp={message.timestamp}
+                          />
+                        )}
+                      </div>
+                    ),
+              )}
+
+              {/* Streaming Message Display */}
+              {streamingMessage && (
+                <AssistantMessage
+                  content={streamingMessage.content}
+                  functionCalls={streamingMessage.functionCalls}
+                  messageIndex={messages.length}
+                  expandedFunctionCalls={expandedFunctionCalls}
+                  onToggle={toggleFunctionCall}
+                  delay={0.4}
+                  isStreaming
+                  isCompleted={false}
+                />
+              )}
+
+              {/* Waiting too long indicator */}
+              {waitingTooLong && !streamingMessage && loading && (
+                <div className="pl-10 space-y-2">
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>The server is taking longer than expected...</span>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    This may be due to high server load. The request will
+                    timeout after 60 seconds.
+                  </p>
+                </div>
+              )}
+            </>
+          )}
+          {!streamingMessage && (
+            <div className="pl-10">
+              <Nudges
+                nudges={loading ? [] : (nudges as string[])}
+                handleSuggestionClick={handleSuggestionClick}
+              />
+            </div>
+          )}
+        </div>
+      </StickToBottom.Content>
+      <div className="p-6 pt-0 max-w-content mx-auto w-full">
+        {/* Input Area - Fixed at bottom */}
+        <ChatInput
+          ref={chatInputRef}
+          input={input}
+          loading={loading}
+          isUploading={isUploading}
+          selectedFilter={selectedFilter}
+          parsedFilterData={parsedFilterData}
+          uploadedFile={uploadedFile}
+          onSubmit={handleSubmit}
+          onChange={setInput}
+          onKeyDown={(e) => {
+            // Handle backspace for filter clearing
+            if (
+              e.key === "Backspace" &&
+              selectedFilter &&
+              input.trim() === ""
+            ) {
+              e.preventDefault();
+              if (isFilterHighlighted) {
+                // Second backspace - remove the filter
+                setConversationFilter(null);
+                setIsFilterHighlighted(false);
+              } else {
+                // First backspace - highlight the filter
+                setIsFilterHighlighted(true);
+              }
+              return;
+            }
+
+            // Handle Enter key for form submission
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              if (input.trim() && !loading) {
+                // Trigger form submission by finding the form and calling submit
+                const form = e.currentTarget.closest("form");
+                if (form) {
+                  form.requestSubmit();
+                }
+              }
+            }
+          }}
+          ingestViaChat={settings?.ingest_via_chat ?? false}
+          onFilterSelect={handleFilterSelect}
+          onFilePickerClick={handleFilePickerClick}
+          onFileSelected={setUploadedFile}
+          setSelectedFilter={setConversationFilter}
+          setIsFilterHighlighted={setIsFilterHighlighted}
+        />
+      </div>
+    </>
+  );
+}
+
+export default function ProtectedChatPage() {
+  const isCloudBrand = useIsCloudBrand();
+  return (
+    <ProtectedRoute>
+      <div
+        className={cn(
+          "flex w-full h-full overflow-hidden",
+          isCloudBrand && "ibm-chat-page",
+          isCloudBrand &&
+            "bg-[var(--chat-surface-bg)] [background-image:linear-gradient(0deg,var(--chat-surface-gradient),transparent_280px)]",
+        )}
+      >
+        <StickToBottom
+          className="flex h-full flex-1 flex-col"
+          resize="smooth"
+          initial="instant"
+          mass={1}
+        >
+          <ChatPage />
+        </StickToBottom>
+      </div>
+    </ProtectedRoute>
+  );
+}

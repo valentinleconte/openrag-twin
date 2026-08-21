@@ -1,0 +1,206 @@
+import json
+import os
+import tempfile
+
+from fastapi import Depends, File, Form, UploadFile
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from dependencies import (
+    get_current_user,
+    get_langflow_file_service,
+    get_session_manager,
+    get_task_service,
+    require_permission,
+)
+from session_manager import User
+from utils.file_utils import langflow_safe_filename_and_mimetype
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+
+class RunIngestionBody(BaseModel):
+    file_paths: list[str] = []
+    file_ids: list[str] | None = None
+    file_metadata: list[dict] | None = None
+    session_id: str | None = None
+    tweaks: dict | None = None
+    settings: dict | None = None
+
+
+class DeleteFilesBody(BaseModel):
+    file_ids: list[str]
+
+
+async def upload_user_file(
+    file: UploadFile = File(...),
+    langflow_file_service=Depends(get_langflow_file_service),
+    user: User = Depends(require_permission("knowledge:upload")),
+):
+    """Upload a file to Langflow's Files API"""
+    try:
+        logger.debug("upload_user_file endpoint called")
+        logger.debug("Processing file", filename=file.filename, size=file.size)
+
+        content = await file.read()
+        # Langflow's docling chokes on text/plain — rename .txt -> .md.
+        upload_filename, upload_mimetype = langflow_safe_filename_and_mimetype(
+            file.filename, file.content_type
+        )
+        file_tuple = (upload_filename, content, upload_mimetype)
+
+        logger.debug("Calling langflow_file_service.upload_user_file")
+        result = await langflow_file_service.upload_user_file(file_tuple, user.jwt_token)
+        logger.debug("Upload successful", result=result)
+        return JSONResponse(result, status_code=201)
+    except Exception as e:
+        logger.error("upload_user_file endpoint failed", error_type=type(e).__name__, error=str(e))
+        import traceback
+
+        logger.error("Full traceback", traceback=traceback.format_exc())
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def run_ingestion(
+    body: RunIngestionBody,
+    langflow_file_service=Depends(get_langflow_file_service),
+    session_manager=Depends(get_session_manager),
+    user: User = Depends(require_permission("knowledge:upload")),
+):
+    """Run a Langflow ingestion flow"""
+    if not body.file_paths and not body.file_ids:
+        return JSONResponse({"error": "Provide file_paths or file_ids"}, status_code=400)
+
+    # Build file_tuples from file_metadata if provided
+    file_tuples = []
+    file_metadata = body.file_metadata or []
+    for i, file_path in enumerate(body.file_paths):
+        if i < len(file_metadata):
+            meta = file_metadata[i]
+            filename = meta.get("filename", "")
+            mimetype = meta.get("mimetype", "application/octet-stream")
+            file_tuples.append((filename, b"", mimetype))
+        else:
+            filename = os.path.basename(file_path)
+            file_tuples.append((filename, b"", "application/octet-stream"))
+
+    settings = body.settings or {}
+    tweaks = langflow_file_service.merge_ui_ingest_settings_into_tweaks(body.tweaks or {}, settings)
+
+    jwt_token = user.jwt_token
+
+    if jwt_token:
+        from auth_context import set_auth_context
+
+        set_auth_context(user.user_id, jwt_token)
+
+    try:
+        result = await langflow_file_service.run_ingestion_flow(
+            file_paths=body.file_paths,
+            file_tuples=file_tuples,
+            jwt_token=jwt_token,
+            session_id=body.session_id,
+            tweaks=tweaks,
+            owner=user.user_id,
+            owner_name=user.name,
+            owner_email=user.email,
+            connector_type="local",
+            selected_embedding_model=settings.get("embeddingModel"),
+        )
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def upload_and_ingest_user_file(
+    file: UploadFile = File(...),
+    session_id: str | None = Form(None),
+    settings_json: str | None = Form(None, alias="settings"),
+    tweaks_json: str | None = Form(None, alias="tweaks"),
+    langflow_file_service=Depends(get_langflow_file_service),
+    session_manager=Depends(get_session_manager),
+    task_service=Depends(get_task_service),
+    user: User = Depends(require_permission("knowledge:upload")),
+):
+    """Upload and ingest a file via Langflow (async background task)"""
+    try:
+        settings = None
+        tweaks = None
+
+        if settings_json:
+            try:
+                settings = json.loads(settings_json)
+            except json.JSONDecodeError as e:
+                return JSONResponse({"error": f"Invalid settings JSON: {e}"}, status_code=400)
+
+        if tweaks_json:
+            try:
+                tweaks = json.loads(tweaks_json)
+            except json.JSONDecodeError as e:
+                return JSONResponse({"error": f"Invalid tweaks JSON: {e}"}, status_code=400)
+
+        jwt_token = user.jwt_token
+        content = await file.read()
+
+        temp_dir = tempfile.gettempdir()
+        safe_filename = file.filename.replace(" ", "_").replace("/", "_")
+        temp_path = os.path.join(temp_dir, safe_filename)
+
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(content)
+
+            task_id = await task_service.create_langflow_upload_task(
+                user_id=user.user_id,
+                file_paths=[temp_path],
+                langflow_file_service=langflow_file_service,
+                session_manager=session_manager,
+                jwt_token=jwt_token,
+                owner_name=user.name,
+                owner_email=user.email,
+                session_id=session_id,
+                tweaks=tweaks,
+                settings=settings,
+            )
+
+            return JSONResponse(
+                {
+                    "task_id": task_id,
+                    "message": f"Langflow upload task created for file '{file.filename}'",
+                    "filename": file.filename,
+                },
+                status_code=202,
+            )
+        except Exception:
+            from utils.file_utils import safe_unlink
+
+            safe_unlink(temp_path)
+            raise
+
+    except Exception as e:
+        logger.error("upload_and_ingest_user_file endpoint failed", error=str(e))
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def delete_user_files(
+    body: DeleteFilesBody,
+    langflow_file_service=Depends(get_langflow_file_service),
+    user: User = Depends(get_current_user),
+):
+    """Delete files from Langflow's Files API"""
+    errors = []
+    for fid in body.file_ids:
+        try:
+            await langflow_file_service.delete_user_file(fid)
+        except Exception as e:
+            errors.append({"file_id": fid, "error": str(e)})
+
+    status = 207 if errors else 200
+    return JSONResponse(
+        {
+            "deleted": [fid for fid in body.file_ids if fid not in [e["file_id"] for e in errors]],
+            "errors": errors,
+        },
+        status_code=status,
+    )

@@ -1,0 +1,237 @@
+"use client";
+
+import { useRouter } from "next/navigation";
+import { useCallback, useState } from "react";
+import { useConnectConnectorMutation } from "@/app/api/mutations/useConnectConnectorMutation";
+import { useDisconnectConnectorMutation } from "@/app/api/mutations/useDisconnectConnectorMutation";
+import {
+  type Connector as QueryConnector,
+  useGetConnectorsQuery,
+} from "@/app/api/queries/useGetConnectorsQuery";
+import { DeleteConfirmationDialog } from "@/components/delete-confirmation-dialog";
+import { useAuth } from "@/contexts/auth-context";
+import { useBrand } from "@/contexts/brand-context";
+import { isSaasPolicyContext } from "@/lib/brand";
+import {
+  getConnectorDescriptor,
+  getConnectorDescriptors,
+} from "@/lib/connectors/registry";
+import ConnectorCard, { type Connector } from "./connector-card";
+import ConnectorsSkeleton from "./connectors-skeleton";
+
+export default function ConnectorCards() {
+  const { isAuthenticated, isNoAuthMode, isIbmAuthMode, cloudContext } =
+    useAuth();
+  const { brand } = useBrand();
+  const isSaasPolicy = isSaasPolicyContext({
+    isIbmAuthMode,
+    cloudContext,
+    brand,
+  });
+  const router = useRouter();
+  const [openDialog, setOpenDialog] = useState<string | null>(null);
+  const [disconnectTarget, setDisconnectTarget] = useState<Connector | null>(
+    null,
+  );
+
+  const { data: queryConnectors = [], isLoading: connectorsLoading } =
+    useGetConnectorsQuery({
+      enabled: isAuthenticated || isNoAuthMode,
+    });
+
+  const connectMutation = useConnectConnectorMutation();
+  const disconnectMutation = useDisconnectConnectorMutation();
+
+  const getConnectorIcon = useCallback((connectorType: string) => {
+    const Icon = getConnectorDescriptor(connectorType)?.Icon;
+    if (!Icon) {
+      return (
+        <div className="w-8 h-8 bg-gray-500 rounded flex items-center justify-center text-white font-bold leading-none shrink-0">
+          ?
+        </div>
+      );
+    }
+    return <Icon />;
+  }, []);
+
+  const connectors = queryConnectors.reduce<Connector[]>((acc, c) => {
+    // Keep OAuth connectors regardless of availability
+    // Only hide credential-based connectors when unavailable
+    if (c.requiresOAuth || c.available !== false) {
+      acc.push({
+        ...c,
+        icon: getConnectorIcon(c.type),
+      } as Connector);
+    }
+    return acc;
+  }, []);
+
+  const handleConnect = async (connector: Connector) => {
+    connectMutation.mutate({
+      connector: connector as unknown as QueryConnector,
+      redirectUri: `${window.location.origin}/auth/callback`,
+    });
+  };
+
+  const handleDisconnect = (connector: Connector) => {
+    setDisconnectTarget(connector);
+  };
+
+  const confirmDisconnect = async () => {
+    if (!disconnectTarget) return;
+    try {
+      await disconnectMutation.mutateAsync(
+        disconnectTarget as unknown as QueryConnector,
+      );
+    } finally {
+      setDisconnectTarget(null);
+    }
+  };
+
+  const navigateToKnowledgePage = (connector: Connector) => {
+    const provider = connector.type.replace(/-/g, "_");
+    router.push(`/upload/${provider}`);
+  };
+
+  const getConfigureHandler = (connector: Connector) => {
+    const descriptor = getConnectorDescriptor(connector.type);
+    if (descriptor?.SettingsDialog) {
+      return () => setOpenDialog(connector.type);
+    }
+    return undefined;
+  };
+
+  if (!connectorsLoading && connectors.length === 0) {
+    if (isSaasPolicy) {
+      return (
+        <p className="text-sm text-muted-foreground">
+          No connectors available or authorized for your organization.
+        </p>
+      );
+    }
+    return null;
+  }
+
+  const dialogDescriptors = getConnectorDescriptors().filter(
+    (d) => d.SettingsDialog,
+  );
+
+  // Split connectors into OAuth and credential-based
+  const oauthConnectors = connectors.filter((c) => c.requiresOAuth);
+  const credentialConnectors = connectors.filter((c) => !c.requiresOAuth);
+
+  return (
+    <>
+      {/* OAuth Connectors Section */}
+      {(connectorsLoading || oauthConnectors.length > 0) && (
+        <div className="space-y-4">
+          <h3 className="text-lg font-semibold">OAuth Connectors</h3>
+          <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+            {connectorsLoading ? (
+              <>
+                <ConnectorsSkeleton />
+                <ConnectorsSkeleton />
+                <ConnectorsSkeleton />
+              </>
+            ) : (
+              oauthConnectors.map((connector) => (
+                <ConnectorCard
+                  key={connector.id}
+                  connector={connector}
+                  isConnecting={
+                    connectMutation.isPending &&
+                    connectMutation.variables?.connector.id === connector.id
+                  }
+                  isDisconnecting={
+                    disconnectMutation.isPending &&
+                    (disconnectMutation.variables as any)?.type ===
+                      connector.type
+                  }
+                  onConnect={handleConnect}
+                  onDisconnect={handleDisconnect}
+                  onNavigateToKnowledge={navigateToKnowledgePage}
+                  onConfigure={getConfigureHandler(connector)}
+                />
+              ))
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Credential-Based Connectors Section */}
+      {(connectorsLoading || credentialConnectors.length > 0) && (
+        <div className="space-y-4">
+          <h3 className="text-lg font-semibold">Credential-Based Connectors</h3>
+          <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+            {connectorsLoading ? (
+              <>
+                <ConnectorsSkeleton />
+                <ConnectorsSkeleton />
+              </>
+            ) : (
+              credentialConnectors.map((connector) => (
+                <ConnectorCard
+                  key={connector.id}
+                  connector={connector}
+                  isConnecting={
+                    connectMutation.isPending &&
+                    connectMutation.variables?.connector.id === connector.id
+                  }
+                  isDisconnecting={
+                    disconnectMutation.isPending &&
+                    (disconnectMutation.variables as any)?.type ===
+                      connector.type
+                  }
+                  onConnect={handleConnect}
+                  onDisconnect={handleDisconnect}
+                  onNavigateToKnowledge={navigateToKnowledgePage}
+                  onConfigure={getConfigureHandler(connector)}
+                />
+              ))
+            )}
+          </div>
+        </div>
+      )}
+
+      {dialogDescriptors.map((descriptor) => {
+        // Render only while open so the component unmounts on close, which
+        // resets all useState/useForm state automatically and eliminates
+        // stale field values, error messages, and stuck loading indicators
+        // on reopen. The exit animation is foregone — an acceptable tradeoff
+        // for correctness.
+        if (openDialog !== descriptor.connectorType) return null;
+        const Dialog = descriptor.SettingsDialog!;
+        return (
+          <Dialog
+            key={descriptor.connectorType}
+            // mounted only while open; open is always true here,
+            // unmount handles "close"
+            open={true}
+            setOpen={(open: boolean) =>
+              setOpenDialog(open ? descriptor.connectorType : null)
+            }
+          />
+        );
+      })}
+
+      <DeleteConfirmationDialog
+        open={disconnectTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDisconnectTarget(null);
+        }}
+        title={`Disconnect ${disconnectTarget?.name ?? "connector"}?`}
+        description={`This will remove the ${disconnectTarget?.name ?? "connector"} connection from OpenRAG.`}
+        confirmText="Disconnect"
+        onConfirm={confirmDisconnect}
+        isLoading={disconnectMutation.isPending}
+      >
+        <p>
+          Any documents previously ingested from this connector will remain in
+          your knowledge base, but new syncs will no longer be possible until
+          you reconnect. Re-authenticating later will allow you to resume
+          syncing.
+        </p>
+      </DeleteConfirmationDialog>
+    </>
+  );
+}
