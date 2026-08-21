@@ -206,7 +206,7 @@ jobs:
 
       - name: Upload OpenRAG image artifact (Fork fallback)
         if: env.IS_FORK == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openrag-ci-image-${{ matrix.image }}-${{ github.sha }}
           path: .ci-artifacts/${{ matrix.image }}.tar
@@ -319,7 +319,7 @@ jobs:
           ls -la keys/ || echo "No keys directory"
 
       - name: Upload service logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: service-logs-${{ matrix.suite }}
@@ -474,7 +474,7 @@ jobs:
           cp ~/.openrag/tui/docling-serve.log service-logs/docling.log 2>&1 || true
 
       - name: Upload service logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: service-logs-shard-${{ matrix.shard }}
@@ -482,7 +482,7 @@ jobs:
           retention-days: 7
 
       - name: Upload blob report (for merge)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: blob-report-shard-${{ matrix.shard }}
@@ -490,7 +490,7 @@ jobs:
           retention-days: 1
 
       - name: Upload test results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: playwright-test-results-shard-${{ matrix.shard }}
@@ -544,7 +544,7 @@ jobs:
         run: npx playwright merge-reports --reporter html ./all-blob-reports
 
       - name: Upload merged HTML report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: frontend/playwright-report/
