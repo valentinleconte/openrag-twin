@@ -25,6 +25,10 @@ nothing here is guessed at.
 
 ```bash
 uv run --with pyyaml python3 eval/run_eval.py --save eval/last_results.json
+
+# or a quick subset, e.g. for a time-boxed demo:
+uv run --with pyyaml python3 eval/run_eval.py --ids know-07,ticket-04,edge-02
+uv run --with pyyaml python3 eval/run_eval.py --category knowledge
 ```
 
 Calls the real `/v1/chat` backend endpoint for each case (the same path the

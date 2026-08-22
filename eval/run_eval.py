@@ -130,11 +130,34 @@ def score_case(case: dict[str, Any], response: str) -> tuple[bool, str]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--save", type=Path, default=None, help="Save full results as JSON to this path")
+    parser.add_argument(
+        "--ids",
+        type=str,
+        default=None,
+        help="Comma-separated case ids to run instead of the full set, e.g. know-01,ticket-04,edge-02",
+    )
+    parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        help="Run only cases in this category (knowledge, ticket_known, ticket_unknown, mixed, off_topic, out_of_corpus)",
+    )
     args = parser.parse_args()
 
     api_key = load_api_key()
     golden_set = yaml.safe_load(GOLDEN_SET_PATH.read_text())
     cases = golden_set["cases"]
+
+    if args.ids:
+        wanted = {i.strip() for i in args.ids.split(",")}
+        cases = [c for c in cases if c["id"] in wanted]
+        missing = wanted - {c["id"] for c in cases}
+        if missing:
+            sys.exit(f"Unknown case id(s): {', '.join(sorted(missing))}")
+    elif args.category:
+        cases = [c for c in cases if c["category"] == args.category]
+        if not cases:
+            sys.exit(f"No cases in category {args.category!r}")
 
     results = []
     by_category: dict[str, list[bool]] = {}
