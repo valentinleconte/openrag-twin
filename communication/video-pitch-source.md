@@ -3,7 +3,7 @@
 > This document is written to be read aloud, not skimmed. It is the primary
 > source for a NotebookLM Video Overview pitching this project. Upload this
 > file (and optionally README.md for extra detail) as a NotebookLM source,
-> then use the customization prompt in `docs/notebooklm-prompt.md` when
+> then use the customization prompt in `notebooklm-prompt.md` when
 > generating the video.
 
 ## What this project is

@@ -185,11 +185,12 @@ Corpus : regénérer avec
 - **5 PRs Dependabot fermées** (mises à jour d'Actions GitHub héritées d'IBM, toutes en
   échec CI, visibles publiquement) + `.github/dependabot.yml` supprimé pour ne pas en
   regénérer.
-- **Workflows CI réduits de 24 à 5** : gardés uniquement ceux qui donnent un vrai signal
-  technique/sécurité et qui passent réellement (`codeql.yml`, `test-ci.yml`,
-  `lint-backend.yml`, `lint-frontend.yml`, `react-doctor.yml`). Supprimés : tout ce qui
-  publie des packages/images Docker, déploie une doc/Pages, gère des labels de PR, ou
-  tourne sur un cron — inapplicable à un fork perso et risque de red-X silencieux.
+- **Workflows CI réduits de 24 à 5** (puis 6 avec l'ajout ultérieur de `pages.yml`, voir plus
+  bas) : gardés uniquement ceux qui donnent un vrai signal technique/sécurité et qui passent
+  réellement (`codeql.yml`, `test-ci.yml`, `lint-backend.yml`, `lint-frontend.yml`,
+  `react-doctor.yml`). Supprimés : tout ce qui publie des packages/images Docker, déploie une
+  doc/Pages, gère des labels de PR, ou tourne sur un cron — inapplicable à un fork perso et
+  risque de red-X silencieux.
 - **Correctif important** : le squash initial gardait un trailer `Co-Authored-By: Claude`
   dans le message de commit — GitHub le traite comme un **contributeur distinct**
   (`?author=claude` a sa propre page), ce qui repassait le compteur à 2. Retiré, re-squashé.
@@ -207,3 +208,12 @@ Corpus : regénérer avec
   `enhancements/` — vrai code importé par `src/connectors/registry.py`, `plugins/` —
   les skills Claude Code y symlinkent) est activement référencé par le build ou le
   runtime : **pas touché**, casser un de ces chemins casse `make dev-cpu`.
+- **Split public/privé de la doc** : le registre de bugs (ci-dessus) a été extrait vers
+  [ENGINEERING_LOG.md](ENGINEERING_LOG.md), en anglais — le README pointait dessus comme
+  "the full engineering log" mais CLAUDE.md est en français, illisible pour un lecteur
+  anglophone. Le README pointe maintenant vers ENGINEERING_LOG.md ; CLAUDE.md reste mes
+  notes de travail (pas besoin d'être parfait pour un public externe, juste pour moi entre
+  sessions). Idem pour `CONTRIBUTING.md`/`SECURITY.md` (toujours le contenu IBM d'origine,
+  non modifié) : ajouté une bannière en tête de chacun clarifiant que ce n'est pas
+  spécifique à ce fork. Et `make help` n'annonce plus `make test-sdk` (référençait
+  `sdks/`, supprimé) — la cible existe toujours dans le Makefile, juste plus mise en avant.

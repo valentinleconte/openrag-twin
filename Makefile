@@ -333,10 +333,6 @@ help_test: ## Show testing commands
 	@echo "                         (uses DockerHub images)"
 	@echo "  $(PURPLE)make test-ci-local$(NC)   - Same as test-ci but builds all images locally"
 	@echo ''
-	@echo "$(PURPLE)SDK Tests:$(NC)"
-	@echo "  $(PURPLE)make test-sdk$(NC)        - Run SDK integration tests"
-	@echo "                         (requires running OpenRAG at localhost:3000)"
-	@echo ''
 	@echo "$(PURPLE)Diagnostic Tests:$(NC)"
 	@echo "  $(PURPLE)make test-os-jwt$(NC)     - Test JWT authentication against OpenSearch"
 	@echo "                         (requires running OpenSearch)"

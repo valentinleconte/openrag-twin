@@ -36,10 +36,10 @@ This repo is **not** a from-scratch reimplementation. It's the genuine upstream 
 - A custom **agent tool** and **routing logic** on top of the stock RAG flow
 - Five real bugs hit and fixed along the way — documented with root cause, not just "it works now"
 
-If you're wondering why the commit history and contributor list look like upstream's: that's
-because they are. I built on top of it deliberately, the way you'd extend a product at work
-rather than re-invent it. My own commits are on top — see `git log` from `docs(CLAUDE.md)` onward,
-or the [full engineering log](CLAUDE.md).
+If you're wondering why the repo starts from a single "Initial commit": that's because it began as
+a full clone of upstream, and I squashed that inherited history so the repo reads as this project
+rather than as a fork's commit-by-commit log — my own work is the commits after it. Nothing
+upstream is hidden; see the [engineering log](ENGINEERING_LOG.md) for what changed and why.
 
 ## What I'm demonstrating
 
@@ -165,7 +165,10 @@ Then open **http://localhost:3000** and try:
 | [`scripts/twin/ticket_status_component.py`](scripts/twin/ticket_status_component.py) | Custom Langflow tool: mock ticket-status lookup, wired into the agent |
 | [`flows/openrag_agent.json`](flows/openrag_agent.json) | The stock agent flow, extended: the tool above + a rewritten routing/citation system prompt |
 | [`scripts/twin/up.sh`](scripts/twin/up.sh), [`sync_langflow_vars.py`](scripts/twin/sync_langflow_vars.py) | One-command, self-validating, self-healing startup |
-| [`CLAUDE.md`](CLAUDE.md) | Full engineering log: every bug, root cause, and fix |
+| [`ENGINEERING_LOG.md`](ENGINEERING_LOG.md) | Full bug registry: every issue, root cause, and fix |
+| [`communication/`](communication/) | The pitch video, its NotebookLM source script and generation prompt |
+| [`.github/workflows/pages.yml`](.github/workflows/pages.yml) | Deploys `communication/` to GitHub Pages so the video plays inline, not as a download |
+| [`CLAUDE.md`](CLAUDE.md) | My own working notes across sessions (in French) — not required reading, linked for transparency |
 | everything else | Upstream [langflow-ai/openrag](https://github.com/langflow-ai/openrag), Apache 2.0 |
 
 ## Bugs found & fixed
@@ -182,7 +185,7 @@ Five, ranging from cosmetic to genuinely instructive. The one worth reading if y
 
 Full writeup with all five (Fernet key formatting, a disabled security default blocking
 onboarding, a broken-but-harmless healthcheck, and the one above hitting two components) in
-[CLAUDE.md](CLAUDE.md).
+[ENGINEERING_LOG.md](ENGINEERING_LOG.md).
 
 ## License
 

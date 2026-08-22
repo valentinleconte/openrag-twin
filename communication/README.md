@@ -9,5 +9,5 @@ build/runtime.
   a direct, dependency-free way to reach it.
 
 Generated with [NotebookLM](https://notebooklm.google.com) from
-[`docs/video-pitch-source.md`](../docs/video-pitch-source.md), using the
-prompt in [`docs/notebooklm-prompt.md`](../docs/notebooklm-prompt.md).
+[`video-pitch-source.md`](video-pitch-source.md), using the
+prompt in [`notebooklm-prompt.md`](notebooklm-prompt.md).

@@ -1,5 +1,10 @@
 # Contributing to OpenRAG
 
+> **Note:** this is upstream's unmodified contributing guide, kept as-is for this fork. It
+> describes how to contribute to the real [langflow-ai/openrag](https://github.com/langflow-ai/openrag)
+> project — this repo is a personal, single-purpose fork, not an actively co-maintained project.
+> See [README.md](README.md) for what this repo actually is.
+
 ![Contributions Welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.13+-blue.svg)

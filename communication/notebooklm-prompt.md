@@ -4,7 +4,7 @@
 
 In a new NotebookLM notebook, add these as sources:
 
-1. **`docs/video-pitch-source.md`** (required — this is the primary script NotebookLM should draw from)
+1. **`video-pitch-source.md`** (required — this is the primary script NotebookLM should draw from)
 2. **`README.md`** (optional, adds detail — the two Mermaid diagrams won't render for NotebookLM, but the surrounding prose about architecture and the classic-vs-agentic comparison is useful extra context)
 
 Do **not** add `CLAUDE.md` — it's a working engineering log, not pitch material, and will pull the tone toward a bug list instead of a pitch.

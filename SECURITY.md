@@ -1,5 +1,10 @@
 # OpenRAG security policy and responsible disclosure
 
+> **Note:** this is upstream's unmodified security policy, kept as-is for this fork. It describes
+> the real [langflow-ai/openrag](https://github.com/langflow-ai/openrag) project's disclosure
+> process, not this repo specifically — nothing here has its own vulnerability program. See
+> [CLAUDE.md](CLAUDE.md) for what actually changed in this fork.
+
 ## Security policy
 
 This security policy applies to all public projects under the langflow-ai organization on GitHub. We prioritize security and continuously work to safeguard our systems. However, vulnerabilities can still exist. If you identify a security issue, please report it to us so we can address it promptly.
