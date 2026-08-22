@@ -157,6 +157,16 @@ Then open **http://localhost:3000** and try:
 - *"What's the status of ticket #101?"* → `Open / High priority / Alice Martin` (mock data, see below)
 - *"What's the status of ticket #999, and what is an index?"* → both tools called, both answered
 
+## Measured, not just claimed
+
+A 17-case [golden set](eval/) checks the routing agent against hand-verified ground truth —
+correct source citations, correct ticket data, honest "not found" behavior when the corpus
+doesn't cover a question, and no tool forced on off-topic input. Latest run: **17/17**.
+
+```bash
+uv run --with pyyaml python3 eval/run_eval.py
+```
+
 ## What's mine vs. upstream
 
 | Path | What it is |
@@ -166,6 +176,7 @@ Then open **http://localhost:3000** and try:
 | [`flows/openrag_agent.json`](flows/openrag_agent.json) | The stock agent flow, extended: the tool above + a rewritten routing/citation system prompt |
 | [`scripts/twin/up.sh`](scripts/twin/up.sh), [`sync_langflow_vars.py`](scripts/twin/sync_langflow_vars.py) | One-command, self-validating, self-healing startup |
 | [`ENGINEERING_LOG.md`](ENGINEERING_LOG.md) | Full bug registry: every issue, root cause, and fix |
+| [`eval/`](eval/) | 17-case golden set + scoring harness for the routing agent |
 | [`communication/`](communication/) | The pitch video, its NotebookLM source script and generation prompt |
 | [`.github/workflows/pages.yml`](.github/workflows/pages.yml) | Deploys `communication/` to GitHub Pages so the video plays inline, not as a download |
 | [`CLAUDE.md`](CLAUDE.md) | My own working notes across sessions (in French) — not required reading, linked for transparency |

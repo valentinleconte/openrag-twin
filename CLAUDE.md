@@ -54,7 +54,15 @@ Jeu de validation (pas encore le golden set — ça viendra en phase éval) :
 - [x] **Agent à routage** — outil mock `get_ticket_status` ajouté + prompt de routage + citation. Fonctionne.
 - [x] **Validation** — 7/7 questions OK (3 connaissance avec citation, 3 ticket dont 1 inconnu, 1 mélange → 2 outils)
 - [x] **Reproductibilité** — `make twin-up` : une seule commande, remonte tout depuis un état froid, s'auto-valide
-- [ ] **Éval** (plus tard) — golden set structuré
+- [x] **Audit repo** — cohérence README/CLAUDE.md/liens, split anglais (ENGINEERING_LOG.md), nettoyage racine
+- [x] **Éval** — golden set structuré (`eval/`), 17 cas, scoring automatique. **17/17 (100%)** au dernier run.
+
+### Golden set — `eval/`
+17 cas dans `eval/golden_set.yaml` (10 connaissance, 3 ticket connu, 1 ticket inconnu, 1 mélange,
+1 hors-sujet, 1 hors-corpus) avec vérité terrain vérifiée à la main contre le corpus et
+`ticket_status_component.py`. Scoring par regex/substring sur la vraie réponse de `/v1/chat` —
+volontairement léger plutôt qu'un framework type RAGAS (le check tient sur un écran, ça suffit
+pour 17 cas). Run : `uv run --with pyyaml python3 eval/run_eval.py --save eval/last_results.json`.
 
 ### Reproductibilité — `make twin-up`
 **Pour relancer la démo après un reboot / arrêt complet, une seule commande :**

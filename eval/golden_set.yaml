@@ -1,0 +1,114 @@
+# Golden set for openrag-twin's routing agent.
+#
+# Each case is scored two ways: did the agent route to the right behavior
+# (cited RAG vs. ticket tool vs. neither), and does the answer actually
+# contain the expected content. Ground truth is hand-verified against the
+# ingested corpus (opensearch-docs-md/) and the mock ticket data
+# (scripts/twin/ticket_status_component.py) — nothing here is guessed.
+#
+# category:
+#   knowledge      -> must cite one of expected_source_substrings, and contain
+#                      at least one of expected_keywords
+#   ticket_known   -> must contain all expected_keywords, must NOT cite a
+#                      docs.opensearch.org source
+#   ticket_unknown -> must contain at least one "not found"-style keyword
+#   mixed          -> must satisfy both a knowledge check and a ticket check
+#   off_topic      -> must NOT look like it forced either tool
+#   out_of_corpus  -> must contain an honest "no relevant sources" style
+#                      admission, not a fabricated answer
+
+cases:
+  - id: know-01
+    category: knowledge
+    question: "What is a document in OpenSearch?"
+    expected_source_substrings: ["getting-started/intro", "getting-started/concepts"]
+    expected_keywords: ["JSON", "basic unit"]
+
+  - id: know-02
+    category: knowledge
+    question: "What's the difference between a node and a cluster in OpenSearch?"
+    expected_source_substrings: ["getting-started/concepts"]
+    expected_keywords: ["server", "node"]
+
+  - id: know-03
+    category: knowledge
+    question: "What are the different ways to search data in OpenSearch?"
+    expected_source_substrings: ["getting-started/search-data"]
+    expected_keywords: ["Query DSL", "SQL", "PPL", "query string"]
+
+  - id: know-04
+    category: knowledge
+    question: "What are the different ways to ingest data into OpenSearch?"
+    expected_source_substrings: ["getting-started/ingest-data"]
+    expected_keywords: ["bulk", "Data Prepper"]
+
+  - id: know-05
+    category: knowledge
+    question: "What does the global aggregation do in OpenSearch?"
+    expected_source_substrings: ["aggregations/bucket/global"]
+    expected_keywords: ["single bucket", "all documents"]
+
+  - id: know-06
+    category: knowledge
+    question: "Are aggregations more or less resource-intensive than regular queries in OpenSearch?"
+    expected_source_substrings: ["aggregations"]
+    expected_keywords: ["CPU", "memory"]
+
+  - id: know-07
+    category: knowledge
+    question: "What are vector embeddings?"
+    expected_source_substrings: ["vector-search/getting-started/concepts"]
+    expected_keywords: ["numerical", "high-dimensional"]
+
+  - id: know-08
+    category: knowledge
+    question: "When was support for combining hybrid search with aggregations introduced in OpenSearch?"
+    expected_source_substrings: ["vector-search/ai-search/hybrid-search/aggregations"]
+    expected_keywords: ["2.13"]
+
+  - id: know-09
+    category: knowledge
+    question: "What do I need to access OpenSearch Dashboards?"
+    expected_source_substrings: ["dashboards/getting-started"]
+    expected_keywords: ["Playground", "installation", "Docker"]
+
+  - id: know-10
+    category: knowledge
+    question: "What kinds of tutorials does OpenSearch offer?"
+    expected_source_substrings: ["tutorials"]
+    expected_keywords: ["semantic search", "hybrid search", "RAG", "conversational"]
+
+  - id: ticket-01
+    category: ticket_known
+    question: "What's the status of ticket #101?"
+    expected_keywords: ["Open", "Alice Martin"]
+
+  - id: ticket-02
+    category: ticket_known
+    question: "Can you check TICKET-102 for me?"
+    expected_keywords: ["In Progress", "Bob Chen"]
+
+  - id: ticket-03
+    category: ticket_known
+    question: "What is the status of ticket 103?"
+    expected_keywords: ["Resolved", "Carla Diaz"]
+
+  - id: ticket-04
+    category: ticket_unknown
+    question: "What is the status of ticket #500?"
+    expected_keywords: ["doesn't exist", "does not exist", "not found", "no ticket", "couldn't find", "could not find"]
+
+  - id: mixed-01
+    category: mixed
+    question: "What's the status of ticket #101, and separately, what is an index in OpenSearch?"
+    expected_keywords: ["Open", "Alice Martin"]
+    expected_source_substrings: ["getting-started/intro", "getting-started/concepts"]
+
+  - id: edge-01
+    category: off_topic
+    question: "Hi, how are you?"
+
+  - id: edge-02
+    category: out_of_corpus
+    question: "How do I configure OpenSearch's snapshot and restore feature?"
+    expected_keywords: ["no relevant", "couldn't find", "could not find", "don't have", "do not have", "not covered", "not found"]
